@@ -15,7 +15,7 @@
 #include "Math.h"
 #include "Sampling.h"
 
-
+#include "BRDFOptimizerSamples.h"
 
 
 
@@ -39,23 +39,10 @@
 #define tileSize 16
 
 
-
-struct BRDFSample {
-	int splatIndex;
-	glm::vec3 omega_i;
-	glm::vec3 omega_o;
-	glm::vec3 normal;
-	glm::vec3 L_i;
-	glm::vec3 L_o;
-	float cosTheta;
-	glm::vec3 fr;
-	float weight;
-};
-
 std::vector<BRDFSample> BRDFSampleList;
 
 
-void writeBRDFSamples(const std::string& filename, Colour colour) {
+void writeBRDFSamples(const std::string& filename) {
 	std::ofstream file(filename);
 	if (!file.is_open()) return;
 
@@ -73,7 +60,7 @@ void writeBRDFSamples(const std::string& filename, Colour colour) {
 			<< s.weight << "\n";
 	}
 
-	file << "\n Final color, " << colour.r << "," << colour.g << "," << colour.b << "\n";
+	file << "\n\n";
 
 	file.close();
 	std::cout << "Saved " << BRDFSampleList.size()
@@ -136,6 +123,21 @@ Colour viewIndependent(Gaussian& gaussian) {
 }
 
 
+void printNormals(std::string fileename) {
+	happly::PLYData plyInNorm(fileename.c_str());
+
+	std::vector<double> elementA_prop1d = plyInNorm.getElement("vertex").getProperty<double>("nx");
+	std::vector<double> elementA_prop2d = plyInNorm.getElement("vertex").getProperty<double>("ny");
+	std::vector<double> elementA_prop3d = plyInNorm.getElement("vertex").getProperty<double>("nz");
+
+	//output to txt file
+	std::ofstream outfile("normals.txt");
+	for (size_t i = 0; i < elementA_prop1d.size(); i++) {
+		outfile << i << " " << elementA_prop1d[i] << " " << elementA_prop2d[i] << " " << elementA_prop3d[i] << std::endl;
+	}
+	outfile.close();
+
+}
 
 
 void parsePLY(std::string filename, std::vector<Gaussian>& gaussians , std::string Normalfilename ) {
@@ -212,27 +214,6 @@ void parsePLY(std::string filename, std::vector<Gaussian>& gaussians , std::stri
 	}
 }
 
-void setCamera(Camera& camera, RTCamera& viewCamera) {
-	Vec3 from(-2.30947, 0.03062, -2.83864);
-	viewCamera.from = from;
-
-	Vec3 to = Vec3(-2.48386, 0.03176, -3.09662);
-	viewCamera.to = to;
-
-	Vec3 up(1.0f, 0.0f, 0.0f);
-	viewCamera.up = up;
-
-	viewCamera.setCamera(&camera);
-}
-
-void setCamera(Camera& camera, RTCamera& viewCamera, Vec3 from, Vec3 to, Vec3 up) {
-	viewCamera.from = from;
-	viewCamera.to = to;
-	viewCamera.up = up;
-
-	viewCamera.setCamera(&camera);
-}
-
 Colour GaussianColor(Ray& ray, std::vector<Gaussian>& in)
 {
 	struct Hit { float t; Gaussian* g; };
@@ -279,7 +260,7 @@ glm::vec3 monteCarloSampling(MTRandom& Sampler, Gaussian& g, std::vector<Gaussia
 	for (int s = 0; s < N_SAMPLES; ++s) {
 		Vec3 localDir = SamplingDistributions::cosineSampleHemisphere(Sampler.next(), Sampler.next());
 		Frame frame;
-		Vec3 normal = fromGLM(g.normal);
+		Vec3 normal = fromGLM(g.GaussNormal);
 		frame.fromVector(normal);
 
 		Vec3 omega_i = frame.toWorld(localDir);
@@ -295,7 +276,7 @@ glm::vec3 monteCarloSampling(MTRandom& Sampler, Gaussian& g, std::vector<Gaussia
 		Colour LiColor = GaussianColor(newRay, bvh->getIntersectedGaussiansVec(1));
 		glm::vec3 L_i = LiColor.ToGlm();
 
-		float cosTheta_i = glm::dot(g.normal, omega_i.ToGlm());
+		float cosTheta_i = glm::dot(g.GaussNormal, omega_i.ToGlm());
 		L_i_sum += L_i * cosTheta_i;
 		hemisphere_weight_sum += cosTheta_i;
 	}
@@ -385,63 +366,59 @@ Colour BRDF(Ray& ray, std::vector<Gaussian>& in, std::vector<Gaussian>& all, MTR
 	return color;
 }
 
-void renderBRDF(Camera& camera, std::vector<Gaussian>& gaussians, BVHNode* bvh)
+void renderBRDF(Camera& camera, std::vector<Gaussian>& gaussians, BVHNode* bvh, bool log = false)
 {
-	//for (unsigned int y = 0; y < camera.width; y++)
-	//{
-	//	for (unsigned int x = startX; x < endX; x++)
-	//	{
-	//		float px = x + 0.5f;
-	//		float py = y + 0.5f;
-	//		Ray ray = camera.generateRay(px, py);
-
-	//		bvh->traverse(ray, gaussians, threadID);
-	//		std::vector<PixelContribution> PC;
-	//		Colour color = GaussianColor(ray, bvh->getIntersectedGaussiansVec(threadID), PC);
-
-	//		int pxy = (y * sizeX) + x;
-	//		pixelContributionsMap[pxy] = PC;
-
-
-	//		//Colour color = GaussianColor(ray, gaussians);
-	//		canvas->draw(x, y, color.r * 255.0f, color.g * 255.0f, color.b * 255.0f);
-	//		film[(y * sizeX) + x] = color;
-	//	}
-	//}
-	int x = camera.width / 2;
-	int y = camera.height / 2;
-	float px = x + 0.5f;
-	float py = y + 0.5f;
-	Ray ray = camera.generateRay(px, py);
-
-
 	MTRandom Sampler;
-	bvh->traverse(ray, gaussians, 0);
-	std::vector<BRDFSample> Brdfs;
-	Colour color = BRDF(ray, bvh->getIntersectedGaussiansVec(0), gaussians, Sampler, bvh);
+	for (unsigned int y = 0; y < camera.height; y++)
+	{
+		for (unsigned int x = 0; x < camera.width; x++)
+		{
+			float px = x + 0.5f;
+			float py = y + 0.5f;
+			Ray ray = camera.generateRay(px, py);
 
-	writeBRDFSamples("BRDF_full.csv", color);
+			bvh->traverse(ray, gaussians, 0);
+			Colour color = BRDF(ray, bvh->getIntersectedGaussiansVec(0), gaussians, Sampler, bvh);
+		}
+	}
+	if(log)
+	writeBRDFSamples("BRDF_full2.csv");
 
+}
+
+void setCamera(Camera& camera, RTCamera& viewCamera) {
+	Vec3 from(-3.0f, -1.0f, -4.0f);
+	viewCamera.from = from;
+
+	Vec3 to = Vec3(-2.0f, 0.0f, 0.0f);
+	viewCamera.to = to;
+
+	Vec3 up(0.0f, -1.0f, 0.0f);
+	viewCamera.up = up;
+
+	viewCamera.setCamera(&camera);
 }
 
 
 int main(int argc, const char* argv[]) {
+
 	std::cout << "Parsing PLY file...\n";
 	std::vector<Gaussian> gaussians{};
 	//parsePLY("point_cloud.ply", gaussians);
 	parsePLY("train.ply", gaussians , "trainWNormal.ply");
 	std::cout << "Done PLY file...\n";
-	float width = 1024;
-	float height = 1024;
+	float width = 50;
+	float height = 50;
 	float fov = 45;
 
 
 
 	Matrix P = Matrix::perspective(0.001f, 10000.0f, (float)width / (float)height, fov);
 
+	RTCamera viewCamera;
 	Camera camera;
 	camera.init(P, width, height);
-
+	setCamera(camera, viewCamera);
 
 	std::cout << "Building BVH...\n";
 	BVHNode bvh;
@@ -450,6 +427,8 @@ int main(int argc, const char* argv[]) {
 
 
 	renderBRDF(camera, gaussians, &bvh);
+	optimizeDiffuseFromSamples(BRDFSampleList);
+
 
 	return 0;
 }

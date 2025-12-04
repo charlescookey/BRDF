@@ -17,8 +17,7 @@
 #include <glm/glm.hpp>
 
 inline std::vector<glm::vec3> optimizeDiffuseFromSamples(const std::vector<BRDFSample>& samples,
-	std::vector<Gaussian>* gaussians = nullptr,
-	int Iterations = 0,
+	int Iterations = 1,
 	float learningRate = 0.01f)
 {
 	// Group samples by splat index
