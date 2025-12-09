@@ -272,6 +272,10 @@ static Vec3 fromGLM(glm::vec3 in) {
 	return Vec3(in.x, in.y, in.z);
 }
 
+static Colour fromGLMC(glm::vec3 in) {
+	return Colour(in.x, in.y, in.z);
+}
+
 
 class Matrix
 {
@@ -817,6 +821,8 @@ struct Gaussian {
 
 	glm::vec3 normal;
 	glm::vec3 GaussNormal;
+
+	glm::vec3 testAlbedo;
 
 	void compute_gaussian_aabb() {
 		float max_sigma = std::expf(scale._max());

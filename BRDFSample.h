@@ -12,6 +12,5 @@ struct BRDFSample {
 	glm::vec3 L_i;
 	glm::vec3 L_o;
 	float cosTheta;
-	glm::vec3 fr;
 	float weight;
 };

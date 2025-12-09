@@ -16,7 +16,7 @@
 #include "BRDFSample.h"
 #include <glm/glm.hpp>
 
-inline std::vector<glm::vec3> optimizeDiffuseFromSamples(const std::vector<BRDFSample>& samples,
+inline std::vector<glm::vec3> optimizeDiffuseFromSamples(const std::vector<BRDFSample>& samples, std::vector<Gaussian>& all,
 	int Iterations = 1,
 	float learningRate = 0.01f)
 {
@@ -115,6 +115,13 @@ inline std::vector<glm::vec3> optimizeDiffuseFromSamples(const std::vector<BRDFS
 		out << i << "," << a.x << "," << a.y << "," << a.z << "," << it->second.size() << "\n";
 	}
 	out.close();
+
+
+	//update the gaussians
+
+	for (size_t i = 0; i < albedos.size(); i++) {
+		all[i].testAlbedo = albedos[i];
+	}
 
 	std::cout << "BRDF optimizer: wrote albedos.csv (" << albedos.size() << " entries)\n";
 	return albedos;
