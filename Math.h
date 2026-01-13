@@ -809,11 +809,7 @@ struct Gaussian {
 	Colour color; // color of the gaussian, used for rendering
 	std::vector<float> higherSH;
 	AABB aabb; // when reading we sgoukd compute this from the position and scale
-	Mat3 covariance; // covariance matrix
 
-	glm::mat3 covariance3D;
-	glm::mat3 covariance3D_inv;
-	glm::mat3 invSigma;
 
 	glm::mat3 R;
 	glm::mat3 S2;
@@ -841,26 +837,10 @@ struct Gaussian {
 		Mat3 scaleMatrix;
 		scaleMatrix.diagonal(_scale);
 
-		covariance = rotationMatrix * scaleMatrix;
-
-		covariance = covariance * covariance.transpose();
-
-		glm::mat3 S = glm::mat3(1.0f);
-		S[0][0] = scale.x;
-		S[1][1] = scale.y;
-		S[2][2] = scale.z;
-
 		glm::quat _rotation = glm::quat(rotation.x, rotation.y, rotation.z, rotation.w);
 		//glm::quat _rotation = glm::quat(rotation.w ,rotation.x, rotation.y, rotation.z);
 		_rotation = glm::normalize(_rotation);
 		R = glm::mat3_cast(_rotation);
-
-		glm::mat3 M = R * S;
-		covariance3D = glm::transpose(M) * M;
-
-		covariance3D = R * S * glm::transpose(S) * glm::transpose(R);
-		covariance3D_inv = glm::inverse(covariance3D);
-
 
 		glm::mat3 S2 = glm::mat3(1.0f);
 		S2[0][0] = 1 / _scale.x;
@@ -869,8 +849,6 @@ struct Gaussian {
 
 		SinvR = R * S2;
 
-		covariance3D = SinvR * glm::transpose(SinvR);
-		invSigma = glm::inverse(covariance3D);
 	}
 
 	void estimateNormal(Ray& ray) {
@@ -895,64 +873,6 @@ struct Gaussian {
 		if (glm::dot(normal, viewDir) < 0.0f) {
 			normal = -normal;
 		}
-	}
-
-	float GaussianDensity(Ray& ray)
-	{
-		Vec3 diff = pos - ray.o;
-		float t = diff.dot(ray.dir);
-		Vec3 p = ray.at(t) - pos;
-
-		//Mahalanobis distance
-
-		float dist = p.x * p.x / covariance.a[0][0] +
-			p.y * p.y / covariance.a[1][1] +
-			p.z * p.z / covariance.a[2][2];
-
-		return expf(-0.5f * dist) * opacity;
-	}
-
-	float computeGaussianIntegral_old(Ray& ray) {
-		Vec3 r = pos - ray.o;
-		ray.dir = ray.dir.normalize();
-
-
-		Vec3 _a = covariance.mulRowVec(ray.dir);
-		float a = _a.dot(ray.dir);
-
-		Vec3 _c = covariance.mulRowVec(r);
-		float c = _c.dot(r);
-
-		float b = _c.dot(ray.dir);
-		float firstPart = std::expf((SQ(b) / (2 * a) - (c / 2)));
-		float secondPart = std::sqrtf(M_PI / (2 * a));
-
-		return firstPart * secondPart;
-	}
-
-	float computeGaussianIntegral(Ray& ray) {
-		Vec3 r = pos - ray.o;
-		//Vec3 r = ray.o - pos;
-		ray.dir = ray.dir.normalize();
-		glm::vec3 _r = r.ToGlm();
-		glm::vec3 _dir = ray.dir.ToGlm();
-
-		glm::vec3 __a = covariance3D * _dir;
-		float a2 = glm::dot(__a, _dir);
-
-		glm::vec3 __c = covariance3D * _r;
-		float c2 = glm::dot(__c, _r);
-
-
-		float b2 = glm::dot(__c, _dir);
-
-		float firstPart2 = std::expf((SQ(b2) / (2 * a2) - (c2 / 2)));
-
-		float secondPart2 = std::sqrtf(M_PI / (2 * a2));
-
-		float integral = firstPart2 * secondPart2;
-
-		return  (1 - std::expf(-integral * opacity));
 	}
 
 	float computeAlpha(const Ray& r)
@@ -982,58 +902,6 @@ struct Gaussian {
 	float erfc_approx(float x) {
 		// Use std::erfc if available
 		return std::erfc(x);
-	}
-
-	// Function to compute I_g
-	float compute_Ig(const Ray& r, float C) {
-		// Construct sigMA as element-wise row sum of invSigma
-		glm::vec3 sigma = invSigma[0] + invSigma[1] + invSigma[2];
-
-		glm::vec3 o = glm::vec3(r.o.x, r.o.y, r.o.z);
-		glm::vec3 d = glm::vec3(r.dir.x, r.dir.y, r.dir.z);
-
-		// Element-wise products
-		glm::vec3 d_times_sigma = d * sigma;
-		glm::vec3 o_times_sigma = o * sigma;
-
-		// Compute scalar values a, b, c
-		float a = glm::dot(d, d_times_sigma);
-		float b = 2.0 * glm::dot(d, o_times_sigma);
-		float c = glm::dot(o, o_times_sigma);
-
-		// Compute the analytical solution
-		float sqrt_a = std::sqrt(a);
-		float exp_term = std::exp((b * b - 4.0 * a * c) / (8.0 * a));
-		float erfc_term = erfc_approx(b / (2.0 * std::sqrt(2.0 * a)));
-
-		float result = C * std::sqrt(M_PI / 2.0) * exp_term * erfc_term / sqrt_a;
-
-		return result;
-		//return opacity * (1 - std::expf(-result));
-	}
-
-	float compute_peak_Ig(const Ray& r, float C) {
-		// Compute the position of maximum density along the ray
-		glm::vec3 sigma = invSigma[0] + invSigma[1] + invSigma[2];
-		glm::vec3 o = glm::vec3(r.o.x, r.o.y, r.o.z);
-		glm::vec3 d = glm::vec3(r.dir.x, r.dir.y, r.dir.z);
-
-		// Element-wise products
-		glm::vec3 d_times_sigma = d * sigma;
-		glm::vec3 o_times_sigma = o * sigma;
-
-		// Compute scalar values a, b
-		float a = glm::dot(d, d_times_sigma);
-		float b = 2.0 * glm::dot(d, o_times_sigma);
-
-		// Compute t at peak density
-		float t_max = -b / (2.0 * a);
-
-		// Evaluate Gaussian at this point
-		glm::vec3 peak_pos = o + t_max * d;
-		float peak_density = C * opacity * exp(-0.5 * glm::dot(peak_pos, peak_pos * sigma));
-
-		return peak_density;
 	}
 
 };
@@ -1097,7 +965,7 @@ public:
 	}
 	// Note there are several options for how to implement the build method. Update this as required
 	void build(std::vector<Gaussian>& inputTriangles) {
-		intersectedGaussiansVec = std::vector<std::vector<Gaussian>>(threadNum);
+		intersectedGaussiansVec = std::vector<std::vector<Gaussian>>(threadNum*3);
 		std::vector<Gaussian*> TempTriangles;
 		for (int i = 0; i < inputTriangles.size(); i++) {
 			TempTriangles.push_back(&inputTriangles[i]);
