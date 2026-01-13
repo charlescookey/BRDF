@@ -17,6 +17,7 @@
 #include "Imaging.h"
 
 #include "BRDFOptimizerSamples.h"
+#include "SingleOptim.h"
 
 
 
@@ -41,13 +42,14 @@
 
 
 std::vector<BRDFSample> BRDFSampleList;
+std::vector<std::vector<BRDFSample>> BRDFSampleList_vec;
 
 
 void writeBRDFSamples(const std::string& filename) {
 	std::ofstream file(filename);
 	if (!file.is_open()) return;
 
-	file << "splatIndex,omega_i.x,omega_i.y,omega_i.z,omega_o.x,omega_o.y,omega_o.z,normal.x,normal.y,normal.z,L_i.x,L_i.y,L_i.z,L_o.x,L_o.y,L_o.z,cosTheta,weight\n";
+	file << "splatIndex,omega_i.x,omega_i.y,omega_i.z,omega_o.x,omega_o.y,omega_o.z,normal.x,normal.y,normal.z,L_i.x,L_i.y,L_i.z,L_o.x,L_o.y,L_o.z,cosTheta,weight,SH.r, SH.g, SH.b\n";
 
 	for (const auto& s : BRDFSampleList) {
 		file << s.splatIndex << ","
@@ -57,7 +59,9 @@ void writeBRDFSamples(const std::string& filename) {
 			<< s.L_i.x << "," << s.L_i.y << "," << s.L_i.z << ","
 			<< s.L_o.x << "," << s.L_o.y << "," << s.L_o.z << ","
 			<< s.cosTheta << ","
-			<< s.weight << "\n";
+			<< s.weight << ","
+			<< s.shColour.x << "," << s.shColour.y << "," << s.shColour.z
+			<< "\n";
 	}
 
 	file << "\n\n";
@@ -214,7 +218,7 @@ void parsePLY(std::string filename, std::vector<Gaussian>& gaussians , std::stri
 	}
 }
 
-Colour GaussianColor(Ray& ray, std::vector<Gaussian>& in)
+Colour GaussianColor(Ray& ray, std::vector<Gaussian>& in, bool correct = true)
 {
 	struct Hit { float t; Gaussian* g; };
 	std::vector<Hit> hits; hits.reserve(in.size());
@@ -246,7 +250,8 @@ Colour GaussianColor(Ray& ray, std::vector<Gaussian>& in)
 		color = color + (SHColor * alpha * tr);
 		tr *= (1.0f - alpha); // Update transmittance
 	}
-	color.correct();
+	if (correct)
+		color.correct();
 	return color;
 }
 
@@ -286,9 +291,10 @@ Colour GaussianAlbedo(Ray& ray, std::vector<Gaussian>& in)
 }
 
 
-glm::vec3 monteCarloSampling(MTRandom& Sampler, Gaussian& g, std::vector<Gaussian>& all, BVHNode* bvh, float& cosTheta) {
+glm::vec3 monteCarloSampling(MTRandom& Sampler, Gaussian& g, std::vector<Gaussian>& all, BVHNode* bvh, float& cosTheta, int threadID = 0) {
 	// --- Monte Carlo hemisphere sampling for incoming radiance ---
-	const int N_SAMPLES = 16;
+	const int N_SAMPLES = 10;
+	float N_SAMPLES_F = 10.f;
 	glm::vec3 L_i_sum(0.0f);
 	float hemisphere_weight_sum = 0.0f;
 
@@ -306,25 +312,27 @@ glm::vec3 monteCarloSampling(MTRandom& Sampler, Gaussian& g, std::vector<Gaussia
 
 
 		// Evaluate radiance along this direction
-		bvh->traverse(newRay, all, 1);
-		Colour LiColor = GaussianColor(newRay, bvh->getIntersectedGaussiansVec(1));
+		bvh->traverse(newRay, all, threadID + threadNum*2);
+		Colour LiColor = GaussianColor(newRay, bvh->getIntersectedGaussiansVec(threadID + threadNum * 2), false);
 		glm::vec3 L_i = LiColor.ToGlm();
 
 		float cosTheta_i = glm::dot(g.GaussNormal, omega_i.ToGlm());
-		L_i_sum += L_i * cosTheta_i;
+		//L_i_sum += L_i * cosTheta_i;
+		L_i_sum += L_i ;
 		hemisphere_weight_sum += cosTheta_i;
 	}
 
 	// Monte Carlo estimate of hemisphere-integrated incoming radiance
-	glm::vec3 L_i_MC = (hemisphere_weight_sum > 0.0f)
-		? (L_i_sum * 3.14159265358979323846f / hemisphere_weight_sum)
-		: glm::vec3(0.0f);
-	cosTheta = hemisphere_weight_sum / N_SAMPLES;
+	//glm::vec3 L_i_MC = (hemisphere_weight_sum > 0.0f) ? (L_i_sum * 3.14159265358979323846f / hemisphere_weight_sum) : glm::vec3(0.0f);
+	//glm::vec3 L_i_MC = L_i_sum * (3.14159265358979323846f / N_SAMPLES_F);
+	glm::vec3 L_i_MC = L_i_sum / N_SAMPLES_F;
+	//cosTheta = hemisphere_weight_sum / N_SAMPLES;
+	cosTheta = 1.0f;
 	return L_i_MC;
 }
 
 
-Colour BRDF(Ray& ray, std::vector<Gaussian>& in, std::vector<Gaussian>& all, MTRandom& Sampler, BVHNode* bvh)
+Colour BRDF(Ray& ray, std::vector<Gaussian>& in, std::vector<Gaussian>& all, MTRandom& Sampler, BVHNode* bvh, int threadID = 0)
 {
 	struct Hit { float t; Gaussian* g; };
 	std::vector<Hit> hits; hits.reserve(in.size());
@@ -352,27 +360,29 @@ Colour BRDF(Ray& ray, std::vector<Gaussian>& in, std::vector<Gaussian>& all, MTR
 
 		Vec3 viewDir = (ray.o - g.pos).normalize();
 		Colour SHColor = evaluateSphericalHarmonics(viewDir, g);
+
 		glm::vec3 omega_o = viewDir.ToGlm();
-		glm::vec3 L_o = color.ToGlm();
+		//glm::vec3 L_o = SHColor.ToGlm();
 		glm::vec3 normal = g.GaussNormal;
 
 		glm::vec3 omega_i = -(ray.dir.normalize().ToGlm());
 
 
-		//geoetric term
-		float NxOmega = glm::dot(normal, omega_i);
+		//start ray at this gauussian in the  view direction to correctly estimate L_o
+		Ray outgoingRay;
+		outgoingRay.init(g.pos , ray.dir);
+		bvh->traverse(outgoingRay, all, threadID + threadNum);
+		Colour LoColor = GaussianColor(outgoingRay, bvh->getIntersectedGaussiansVec(threadID + threadNum), false);
+		glm::vec3 L_o = LoColor.ToGlm();
 
 		float contribution = alpha * tr;
 
 		if (contribution > 0.05f) {
-			glm::vec3 L_e(0, 0, 0); // assume zero unless you have emission data
-
 			float cosTheta_i;
-			glm::vec3 L_i = monteCarloSampling(Sampler, g, all, bvh, cosTheta_i);
+			glm::vec3 L_i = monteCarloSampling(Sampler, g, all, bvh, cosTheta_i, threadID);
 			
-
 			// store sample: splat index, omega_i, omega_o(viewDir), normal, fr_est, weight
-			BRDFSampleList.push_back({ g.index ,omega_i , omega_o, normal , L_i , L_o,cosTheta_i, contribution });
+			BRDFSampleList_vec[threadID].push_back({g.index ,omega_i , omega_o, normal , L_i , L_o, cosTheta_i, contribution , SHColor.ToGlm()});
 		}
 		color = color + (SHColor * alpha * tr);
 		tr *= (1.0f - alpha); // Update transmittance
@@ -399,14 +409,86 @@ void renderBRDF(Camera& camera, std::vector<Gaussian>& gaussians, BVHNode* bvh, 
 			glm::vec3 finalColor = color.ToGlm();
 			int end = BRDFSampleList.size();
 
-			for(int i = start; i < end; i++) {
-				BRDFSampleList[i].L_o = finalColor - BRDFSampleList[i].L_o;
-			}
+			//for(int i = start; i < end; i++) {
+				//BRDFSampleList[i].L_o = finalColor - BRDFSampleList[i].L_o;
+			//}
 		}
 	}
 	if(log)
 	writeBRDFSamples("BRDF_Correctfull.csv");
 
+}
+
+void renderBRDF_MT(int tileX, int tileY, int sizeX, int sizeY,int threadID, Camera& camera, std::vector<Gaussian>& gaussians, BVHNode* bvh)
+{
+	MTRandom Sampler;
+	int startX = tileX * tileSize;
+	int startY = tileY * tileSize;
+	int endX = std::min(startX + tileSize, sizeX);
+	int endY = std::min(startY + tileSize, sizeY);
+
+	for (unsigned int y = startY; y < endY; y++)
+	{
+		for (unsigned int x = startX; x < endX; x++)
+		{
+			float px = x + 0.5f;
+			float py = y + 0.5f;
+			Ray ray = camera.generateRay(px, py);
+
+			bvh->traverse(ray, gaussians, threadID);
+
+			Colour color = BRDF(ray, bvh->getIntersectedGaussiansVec(threadID), gaussians, Sampler, bvh, threadID);
+
+		}
+	}
+}
+
+void BRDF_MT(Camera& camera, std::vector<Gaussian>& gaussians, BVHNode* bvh, bool log = true)
+{
+	//there is a bug here, inn canvas draw,int index = ((y * width) + x) * 3; so we use y as width
+
+	int tilesY = (camera.width + tileSize - 1) / tileSize;
+	int tilesX = (camera.height + tileSize - 1) / tileSize;
+
+	int totalTiles = tilesX * tilesY;
+
+	std::atomic<int> tileNum(0);
+	std::vector<std::thread> threads;
+
+	BRDFSampleList_vec = std::vector<std::vector<BRDFSample>>(threadNum);
+
+	auto threadFunc = [&](int threadID) {
+		unsigned long i;
+
+		while ((i = tileNum.fetch_add(1)) < totalTiles) {
+			int tileX = i / tilesX;
+			int tileY = i % tilesX;
+
+			renderBRDF_MT(tileX, tileY, camera.width, camera.height, threadID, camera, gaussians, bvh);
+		}
+
+		//print percentage
+		if (i % (totalTiles / 10) == 0) {
+			std::cout << "Rendering progress: " << (i * 100 / totalTiles) << "%\n";
+		}
+		};
+
+	for (int i = 0; i < threadNum; i++) {
+		threads.emplace_back(threadFunc, i);
+	}
+
+	for (auto& thread : threads) {
+		thread.join();
+	}
+
+	//combine all thread BRDFSampleList_vec into BRDFSampleList
+	std::cout << "Combining BRDF samples from all threads...\n";
+	for (int i = 0; i < threadNum; i++) {
+		BRDFSampleList.insert(BRDFSampleList.end(), BRDFSampleList_vec[i].begin(), BRDFSampleList_vec[i].end());
+	}
+
+	if (log)
+		writeBRDFSamples("BRDF_Correctfull.csv");
 }
 
 void setCamera(Camera& camera, RTCamera& viewCamera) {
@@ -470,14 +552,14 @@ void renderImageSH(Camera& camera, GamesEngineeringBase::Window* canvas, std::ve
 
 			canvas->draw(x, y, color.r * 255.0f, color.g * 255.0f, color.b * 255.0f);
 
-			//std::cout << "\nRendering pixel (" << x << ", " << y << ") - Color: ("<< color.r << ", "<< color.g << ", "<< color.b << ")\n";
+
 		}
 		//print percentage at intervals of 10%
 		if (y % (height / 10) == 0) {
 			std::cout << "Rendering progress: " << (y * 100 / height) << "%\r";
 		}
-
 	}
+
 }
 
 void readAlbedoCSV(std::string filename, std::vector<Gaussian>& all) {
@@ -517,6 +599,43 @@ void getAlbedoCSV(std::vector<glm::vec3> albedos, std::vector<Gaussian>& all) {
 	}
 }
 
+// test funxtions would remove later
+
+void renderBRDF2(Camera& camera, std::vector<Gaussian>& gaussians, BVHNode* bvh, bool log = false)
+{
+	MTRandom Sampler;
+	//int middleY = camera.height / 2;
+	int middleY = 34;
+	int middleX = 52;
+	Colour color;
+
+	for (unsigned int y = middleY; y < middleY + 1; y++)
+	{
+		for (unsigned int x = middleX; x < middleX + 1; x++)
+		{
+			float px = x + 0.5f;
+			float py = y + 0.5f;
+			Ray ray = camera.generateRay(px, py);
+
+			bvh->traverse(ray, gaussians, 0);
+
+			//int start = BRDFSampleList.size();
+			color = BRDF(ray, bvh->getIntersectedGaussiansVec(0), gaussians, Sampler, bvh);
+			//glm::vec3 finalColor = color.ToGlm();
+			//int end = BRDFSampleList.size();
+
+			//for(int i = start; i < end; i++) {
+				//BRDFSampleList[i].L_o = finalColor - BRDFSampleList[i].L_o;
+			//}
+			std::cout << "Rendering pixel (" << x << ", " << y << ") - Color: (" << color.r * 255.0f << ", " << color.g * 255.0f << ", " << color.b * 255.0f << ")\n";
+		}
+
+	}
+	if (log)
+		writeBRDFSamples("BRDF_Middle.csv");
+	std::cout << "Final Color at center pixel: (" << color.r << ", " << color.g << ", " << color.b << ")\n";
+
+}
 
 int main(int argc, const char* argv[]) {
 
@@ -525,8 +644,8 @@ int main(int argc, const char* argv[]) {
 	//parsePLY("point_cloud.ply", gaussians);
 	parsePLY("train.ply", gaussians , "trainWNormal.ply");
 	std::cout << "Done PLY file...\n";
-	float width = 100;
-	float height = 100;
+	float width = 75;
+	float height = 75;
 	float fov = 45;
 
 
@@ -544,11 +663,15 @@ int main(int argc, const char* argv[]) {
 
 
 	std::cout << "Obtaining BRDF samples...\n";
-	renderBRDF(camera, gaussians, &bvh , true);
+	//	renderBRDF(camera, gaussians, &bvh , true);
+	BRDF_MT(camera, gaussians, &bvh );
 	std::cout << "Done obtaining BRDF samples...\n";
 
+	//return 0;
+
 	std::cout << "Optimizing diffuse albedos from samples...\n";
-	optimizeDiffuseFromSamples(BRDFSampleList, gaussians, 10 );
+	//optimizeDiffuseFromSamples2(BRDFSampleList, gaussians);
+	optimizeDiffuseFromSamples(BRDFSampleList, gaussians);
 	std::cout << "Done optimizing diffuse albedos from samples...\n";
 
 	//readAlbedoCSV("albedos.csv", gaussians);

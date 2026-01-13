@@ -13,4 +13,6 @@ struct BRDFSample {
 	glm::vec3 L_o;
 	float cosTheta;
 	float weight;
+
+	glm::vec3 shColour;
 };
