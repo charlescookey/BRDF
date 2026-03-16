@@ -819,6 +819,7 @@ struct Gaussian {
 	glm::vec3 GaussNormal;
 
 	glm::vec3 testAlbedo;
+	glm::vec3 testColor;
 
 	void compute_gaussian_aabb() {
 		float max_sigma = std::expf(scale._max());

@@ -1,7 +1,3 @@
-#include <rapidjson/document.h>
-#include <rapidjson/writer.h>
-#include <rapidjson/stringbuffer.h>
-
 #include <iostream>
 
 
@@ -18,6 +14,8 @@
 
 #include "BRDFOptimizerSamples.h"
 #include "SingleOptim.h"
+#include "DisneyBRDFOptimizerSimple.h"
+#include "CosBRDF_Disney.h"
 
 
 
@@ -45,11 +43,11 @@ std::vector<BRDFSample> BRDFSampleList;
 std::vector<std::vector<BRDFSample>> BRDFSampleList_vec;
 
 
-void writeBRDFSamples(const std::string& filename) {
+void writeBRDFSamples(const std::string& filename, std::vector<Gaussian>& gaussians) {
 	std::ofstream file(filename);
 	if (!file.is_open()) return;
 
-	file << "splatIndex,omega_i.x,omega_i.y,omega_i.z,omega_o.x,omega_o.y,omega_o.z,normal.x,normal.y,normal.z,L_i.x,L_i.y,L_i.z,L_o.x,L_o.y,L_o.z,cosTheta,weight,SH.r, SH.g, SH.b\n";
+	file << "splatIndex,omega_i.x,omega_i.y,omega_i.z,omega_o.x,omega_o.y,omega_o.z,normal.x,normal.y,normal.z,L_i.x,L_i.y,L_i.z,L_o.x,L_o.y,L_o.z,cosTheta,weight,SH.r, SH.g, SH.b, albedo.r,albedo.g,albedo.b\n";
 
 	for (const auto& s : BRDFSampleList) {
 		file << s.splatIndex << ","
@@ -60,7 +58,8 @@ void writeBRDFSamples(const std::string& filename) {
 			<< s.L_o.x << "," << s.L_o.y << "," << s.L_o.z << ","
 			<< s.cosTheta << ","
 			<< s.weight << ","
-			<< s.shColour.x << "," << s.shColour.y << "," << s.shColour.z
+			<< s.shColour.x << "," << s.shColour.y << "," << s.shColour.z << ","
+			<< gaussians[s.splatIndex].testAlbedo.x << "," << gaussians[s.splatIndex].testAlbedo.y << "," << gaussians[s.splatIndex].testAlbedo.z
 			<< "\n";
 	}
 
@@ -179,6 +178,8 @@ void parsePLY(std::string filename, std::vector<Gaussian>& gaussians , std::stri
 
 	for (size_t i = 0; i < elementA_prop1.size(); i++) {
 		gaussians[i].ZeroSH = Vec3(elementA_prop1[i], elementA_prop2[i], elementA_prop3[i]);
+		gaussians[i].color = viewIndependent(gaussians[i]);
+		gaussians[i].testColor = gaussians[i].color.ToGlm();
 	}
 
 	elementA_prop1 = plyIn.getElement("vertex").getProperty<float>("scale_0");
@@ -293,8 +294,8 @@ Colour GaussianAlbedo(Ray& ray, std::vector<Gaussian>& in)
 
 glm::vec3 monteCarloSampling(MTRandom& Sampler, Gaussian& g, std::vector<Gaussian>& all, BVHNode* bvh, float& cosTheta, int threadID = 0) {
 	// --- Monte Carlo hemisphere sampling for incoming radiance ---
-	const int N_SAMPLES = 10;
-	float N_SAMPLES_F = 10.f;
+	const int N_SAMPLES = 12;
+	float N_SAMPLES_F = 12.f;
 	glm::vec3 L_i_sum(0.0f);
 	float hemisphere_weight_sum = 0.0f;
 
@@ -317,15 +318,16 @@ glm::vec3 monteCarloSampling(MTRandom& Sampler, Gaussian& g, std::vector<Gaussia
 		glm::vec3 L_i = LiColor.ToGlm();
 
 		float cosTheta_i = glm::dot(g.GaussNormal, omega_i.ToGlm());
-		//L_i_sum += L_i * cosTheta_i;
-		L_i_sum += L_i ;
+		L_i_sum += L_i * cosTheta_i;
+		//L_i_sum += L_i ;
 		hemisphere_weight_sum += cosTheta_i;
 	}
 
 	// Monte Carlo estimate of hemisphere-integrated incoming radiance
 	//glm::vec3 L_i_MC = (hemisphere_weight_sum > 0.0f) ? (L_i_sum * 3.14159265358979323846f / hemisphere_weight_sum) : glm::vec3(0.0f);
 	//glm::vec3 L_i_MC = L_i_sum * (3.14159265358979323846f / N_SAMPLES_F);
-	glm::vec3 L_i_MC = L_i_sum / N_SAMPLES_F;
+	//glm::vec3 L_i_MC = L_i_sum / N_SAMPLES_F;
+	glm::vec3 L_i_MC = L_i_sum * (3.14159f / N_SAMPLES_F);  // CORRECT
 	//cosTheta = hemisphere_weight_sum / N_SAMPLES;
 	cosTheta = 1.0f;
 	return L_i_MC;
@@ -362,18 +364,18 @@ Colour BRDF(Ray& ray, std::vector<Gaussian>& in, std::vector<Gaussian>& all, MTR
 		Colour SHColor = evaluateSphericalHarmonics(viewDir, g);
 
 		glm::vec3 omega_o = viewDir.ToGlm();
-		//glm::vec3 L_o = SHColor.ToGlm();
+		glm::vec3 L_o = SHColor.ToGlm();
 		glm::vec3 normal = g.GaussNormal;
 
 		glm::vec3 omega_i = -(ray.dir.normalize().ToGlm());
 
 
 		//start ray at this gauussian in the  view direction to correctly estimate L_o
-		Ray outgoingRay;
-		outgoingRay.init(g.pos , ray.dir);
-		bvh->traverse(outgoingRay, all, threadID + threadNum);
-		Colour LoColor = GaussianColor(outgoingRay, bvh->getIntersectedGaussiansVec(threadID + threadNum), false);
-		glm::vec3 L_o = LoColor.ToGlm();
+		//Ray outgoingRay;
+		//outgoingRay.init(g.pos , ray.dir);
+		//bvh->traverse(outgoingRay, all, threadID + threadNum);
+		//Colour LoColor = GaussianColor(outgoingRay, bvh->getIntersectedGaussiansVec(threadID + threadNum), false);
+		//glm::vec3 L_o = LoColor.ToGlm();
 
 		float contribution = alpha * tr;
 
@@ -414,8 +416,8 @@ void renderBRDF(Camera& camera, std::vector<Gaussian>& gaussians, BVHNode* bvh, 
 			//}
 		}
 	}
-	if(log)
-	writeBRDFSamples("BRDF_Correctfull.csv");
+	//if(log)
+		//writeBRDFSamples("BRDF_Correctfull.csv");
 
 }
 
@@ -468,9 +470,9 @@ void BRDF_MT(Camera& camera, std::vector<Gaussian>& gaussians, BVHNode* bvh, boo
 		}
 
 		//print percentage
-		if (i % (totalTiles / 10) == 0) {
-			std::cout << "Rendering progress: " << (i * 100 / totalTiles) << "%\n";
-		}
+		//if (i % (totalTiles / 10) == 0) {
+			//std::cout << "Rendering progress: " << (i * 100 / totalTiles) << "%\n";
+		//}
 		};
 
 	for (int i = 0; i < threadNum; i++) {
@@ -487,21 +489,26 @@ void BRDF_MT(Camera& camera, std::vector<Gaussian>& gaussians, BVHNode* bvh, boo
 		BRDFSampleList.insert(BRDFSampleList.end(), BRDFSampleList_vec[i].begin(), BRDFSampleList_vec[i].end());
 	}
 
-	if (log)
-		writeBRDFSamples("BRDF_Correctfull.csv");
+	//if (log)
+		//writeBRDFSamples("BRDF_Correctfull.csv");
 }
 
 void setCamera(Camera& camera, RTCamera& viewCamera) {
-	Vec3 from(-3.0f, -1.0f, -4.0f);
+	//Vec3 from(-3.0f, -1.0f, -4.0f);
+	Vec3 from(-0.0f, -0.0f, -20.0f);
 	viewCamera.from = from;
 
-	Vec3 to = Vec3(-2.0f, 0.0f, 0.0f);
+	//Vec3 to = Vec3(-2.0f, 0.0f, 0.0f);
+	Vec3 to(0.0f, 0.0f, 0.0f);
 	viewCamera.to = to;
 
-	Vec3 up(0.0f, -1.0f, 0.0f);
+	//Vec3 up(0.0f, -1.0f, 0.0f);
+	Vec3 up(0.0f, 1.0f, 0.0f);
 	viewCamera.up = up;
 
 	viewCamera.setCamera(&camera);
+
+
 }
 
 void renderImageAlbedo(Camera& camera, GamesEngineeringBase::Window* canvas, std::vector<Gaussian>& gaussians, BVHNode* bvh) {
@@ -631,8 +638,8 @@ void renderBRDF2(Camera& camera, std::vector<Gaussian>& gaussians, BVHNode* bvh,
 		}
 
 	}
-	if (log)
-		writeBRDFSamples("BRDF_Middle.csv");
+	//if (log)
+		///writeBRDFSamples("BRDF_Middle.csv");
 	std::cout << "Final Color at center pixel: (" << color.r << ", " << color.g << ", " << color.b << ")\n";
 
 }
@@ -642,10 +649,11 @@ int main(int argc, const char* argv[]) {
 	std::cout << "Parsing PLY file...\n";
 	std::vector<Gaussian> gaussians{};
 	//parsePLY("point_cloud.ply", gaussians);
-	parsePLY("train.ply", gaussians , "trainWNormal.ply");
+	//parsePLY("shader_ball1.ply", gaussians , "shader_ball1.ply");
+	parsePLY("shader_ball_sh.ply", gaussians , "shader_ball_sh.ply");
 	std::cout << "Done PLY file...\n";
-	float width = 75;
-	float height = 75;
+	float width = 50;
+	float height = 50;
 	float fov = 45;
 
 
@@ -663,7 +671,8 @@ int main(int argc, const char* argv[]) {
 
 
 	std::cout << "Obtaining BRDF samples...\n";
-	//	renderBRDF(camera, gaussians, &bvh , true);
+	//renderBRDF(camera, gaussians, &bvh , true);
+	
 	BRDF_MT(camera, gaussians, &bvh );
 	std::cout << "Done obtaining BRDF samples...\n";
 
@@ -671,22 +680,30 @@ int main(int argc, const char* argv[]) {
 
 	std::cout << "Optimizing diffuse albedos from samples...\n";
 	//optimizeDiffuseFromSamples2(BRDFSampleList, gaussians);
-	optimizeDiffuseFromSamples(BRDFSampleList, gaussians);
+	//optimizeDiffuseFromSamples(BRDFSampleList, gaussians,30);
+	
+	optimizeDisneyBRDFSimple(BRDFSampleList, gaussians, 10000);
+	optimizeDisneyBRDFCosineSim(BRDFSampleList, gaussians, 10000);
+
 	std::cout << "Done optimizing diffuse albedos from samples...\n";
 
 	//readAlbedoCSV("albedos.csv", gaussians);
 
+	writeBRDFSamples("BRDF_Correctfull.csv", gaussians);
+
+	//return 0;
+
 	std::cout << "Rendering final image using Albedos...\n";
-	GamesEngineeringBase::Window canvas;
-	canvas.create((int)width, (int)height, "BRDF Optimization");
-	renderImageAlbedo(camera, &canvas, gaussians, &bvh);
-	savePNG("optimized_albedo.png", &canvas);
+	//GamesEngineeringBase::Window canvas;
+	//canvas.create((int)width, (int)height, "BRDF Optimization");
+	//renderImageAlbedo(camera, &canvas, gaussians, &bvh);
+	//savePNG("optimized_albedo.png", &canvas);
 	std::cout << "Done rendering final image using Albedos...\n";
 
 	std::cout << "Rendering final image using Spherical Harmonics...\n";
-	canvas.clear();
-	renderImageSH(camera, &canvas, gaussians, &bvh);
-	savePNG("spherical_harmonics.png", &canvas);
+	//canvas.clear();
+	//renderImageSH(camera, &canvas, gaussians, &bvh);
+	//savePNG("newSphere.png", &canvas);
 	std::cout << "Done rendering final image using Spherical Harmonics...\n";
 
 

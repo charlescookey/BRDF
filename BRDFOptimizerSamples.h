@@ -16,7 +16,7 @@
 #include "BRDFSample.h"
 #include <glm/glm.hpp>
 
-inline std::vector<glm::vec3> optimizeDiffuseFromSamples(const std::vector<BRDFSample>& samples, std::vector<Gaussian>& all,
+void optimizeDiffuseFromSamples(const std::vector<BRDFSample>& samples, std::vector<Gaussian>& all,
 	int Iterations = 0,
 	float learningRate = 0.01f)
 {
@@ -106,23 +106,24 @@ inline std::vector<glm::vec3> optimizeDiffuseFromSamples(const std::vector<BRDFS
 	}
 
 	// Write results
+	
 	std::ofstream out("albedos.csv");
-	out << "splatIndex,albedo.r,albedo.g,albedo.b,sampleCount\n";
+	out << "splatIndex,albedo.r,albedo.g,albedo.b,sampleCount,SH.r,SH.g,SH.b\n";
 	for (size_t i = 0; i < albedos.size(); ++i) {
 		auto it = groups.find((int)i);
 		if (it == groups.end()) continue;
 		const glm::vec3& a = albedos[i];
-		out << i << "," << a.x << "," << a.y << "," << a.z << "," << it->second.size() << "\n";
+		out << i << "," << a.x << "," << a.y << "," << a.z << "," << it->second.size() << ","
+		<< all[i].color.r << "," << all[i].color.g << "," << all[i].color.b << "\n";
 	}
 	out.close();
+	
 
 
 	//update the gaussians
-
 	for (size_t i = 0; i < albedos.size(); i++) {
 		all[i].testAlbedo = albedos[i];
 	}
 
-	std::cout << "BRDF optimizer: wrote albedos.csv (" << albedos.size() << " entries)\n";
-	return albedos;
+	//std::cout << "BRDF optimizer: wrote albedos.csv (" << albedos.size() << " entries)\n";
 }
