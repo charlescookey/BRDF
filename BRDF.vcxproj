@@ -78,11 +78,11 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
-    <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);C:\Users\charl\OneDrive\Documents\GitHub\glm;C:\Users\charl\OneDrive\Documents\GitHub\rapidjson\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);C:\Users\charl\OneDrive\Documents\GitHub\glm;C:\Users\charl\OneDrive\Documents\GitHub\rapidjson\include;C:\Users\charl\OneDrive\Documents\GitHub\autodiff;C:\Users\charl\OneDrive\Documents\GitHub\eigen;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);C:\Users\charl\OneDrive\Documents\GitHub\glm;C:\Users\charl\OneDrive\Documents\GitHub\rapidjson\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);C:\Users\charl\OneDrive\Documents\GitHub\glm;C:\Users\charl\OneDrive\Documents\GitHub\rapidjson\include;C:\Users\charl\OneDrive\Documents\GitHub\autodiff;C:\Users\charl\OneDrive\Documents\GitHub\eigen;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -151,6 +151,7 @@
   <ItemGroup>
     <ClInclude Include="BRDFOptimizerSamples.h" />
     <ClInclude Include="BRDFSample.h" />
+    <ClInclude Include="BRDF_Optim_AutoDiff.h" />
     <ClInclude Include="CosBRDF_Disney.h" />
     <ClInclude Include="DisneyBRDFOptimizerSimple.h" />
     <ClInclude Include="GamesEngineeringBase.h" />

@@ -56,5 +56,8 @@
     <ClInclude Include="CosBRDF_Disney.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="BRDF_Optim_AutoDiff.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
