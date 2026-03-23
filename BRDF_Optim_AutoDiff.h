@@ -327,7 +327,9 @@ void optimizeDisneyBRDFAutodiff(
     std::vector<DisneyBRDFParamsSimple> params(maxIndex + 1);
 
     for (size_t i = 0; i < params.size() && i < gaussians.size(); ++i) {
-        params[i].baseColor = glm::clamp(gaussians[i].testColor, 0.02f, 0.98f);
+        //params[i].baseColor = glm::clamp(gaussians[i].testColor, 0.02f, 0.98f);
+        MTRandom sample(4);
+        params[i].baseColor = glm::vec3(sample.next(), sample.next(), sample.next());
         params[i].metallic = 0.f;
         params[i].roughness = 0.5f;
         params[i].specular = 0.5f;

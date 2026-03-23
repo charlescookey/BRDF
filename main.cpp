@@ -673,7 +673,7 @@ int main(int argc, const char* argv[]) {
 
 	std::cout << "Parsing PLY file...\n";
 	std::vector<Gaussian> gaussians{};
-	parsePLY("test_scene.ply", gaussians, "test_scene.ply");
+	parsePLY("test_scene_Diff.ply", gaussians, "test_scene_Diff.ply");
 	std::cout << "Done PLY file...\n";
 
 	float width = 10, height = 10, fov = 45;
