@@ -11,20 +11,25 @@
 //   roughness  (float)   surface roughness
 //   specular   (float)   specular weight (dielectric F0 scale)
 //
-// Why autodiff instead of finite differences?
+// Loss formulation (fixed):
 //
-//   Finite-difference (old):   
-//   Autodiff reverse-mode:     1 forward pass + 1 backward pass per sample
-//                              exact gradients, no E tuning, ~3-6× faster
-// 
+//   Instead of treating each hemisphere sample as an independent (Li -> Lo)
+//   pair, we compute the full Monte Carlo estimate of the rendering equation
+//   per splat and compare it against the SH colour (the true Lo):
+//
+//     L_o_pred = (pi / N) * sum_i[ BRDF(wi, wo, N) * Li * NdotL_i ]
+//     loss     = || L_o_pred - L_o_sh ||^2
+//
+//   This is the correct formulation because L_o_sh IS the integral of the
+//   rendering equation -- the SH encodes the view-dependent appearance of
+//   the splat, which is exactly what BRDF * Li integrated over the hemisphere
+//   should equal.
 //
 // Dependencies:
 //   autodiff   header-only, install via vcpkg: `vcpkg install autodiff`
 //               or CMake FetchContent from https://github.com/autodiff/autodiff
 //   glm        already used by original code
 //   C++17 or later
-//
-// Adam optimizer and all hyper-parameters are unchanged from the original.
 
 #include <vector>
 #include <unordered_map>
@@ -38,7 +43,7 @@
 
 #include <glm/glm.hpp>
 
-// autodiff reverse-mode header  (var.hpp only no Eigen integration needed)
+// autodiff reverse-mode header (var.hpp only, no Eigen integration needed)
 #include <autodiff/reverse/var.hpp>
 
 using namespace autodiff;
@@ -49,8 +54,8 @@ using namespace autodiff;
 
 
 //
-// Adam optimizer state  (identical to the original)
-// 
+// Adam optimizer state (identical to the original)
+//
 struct AdamStateAD {
     // First moments
     glm::vec3 m_bc = glm::vec3(0.f);
@@ -85,11 +90,11 @@ struct AdamStateAD {
 
 
 //
-// Templated Disney BRDF  (works with T = float  OR  T = autodiff::var)
-// 
+// Templated Disney BRDF (works with T = float OR T = autodiff::var)
+//
 namespace DisneyAD {
 
-    // Helper: Schlick Fresnel  (works for any scalar type)
+    // Schlick Fresnel
     template<typename T>
     inline T schlickFresnel(T u) {
         T m = T(1.0) - u;
@@ -128,25 +133,20 @@ namespace DisneyAD {
     // -------------------------------------------------------------------------
     // Core BRDF evaluation
     //
-    // Params are passed as individual autodiff::var scalars so the tape can
-    // track them.  Directions and normal remain plain glm::vec3 (no gradient
-    // needed through geometry).
+    // Directions and normal are plain glm::vec3 (no gradient through geometry).
+    // omega_i MUST be normalized before calling -- caller's responsibility.
     // -------------------------------------------------------------------------
     template<typename T>
     inline void evaluate(
-        // BRDF parameters (differentiable when T = autodiff::var)
         T bc_r, T bc_g, T bc_b,
         T metallic,
         T roughness,
         T specular,
-        // Geometry (plain floats no differentiation through these)
-        const glm::vec3& V,
-        const glm::vec3& L,
-        const glm::vec3& N,
-        // Outputs: three colour channels
+        const glm::vec3& V,   // view direction (omega_o), normalized
+        const glm::vec3& L,   // light direction (omega_i), normalized
+        const glm::vec3& N,   // surface normal, normalized
         T& out_r, T& out_g, T& out_b
     ) {
-        // Dot products with clamping
         float ndl_f = glm::clamp(glm::dot(N, L), 0.f, 1.f);
         float ndv_f = glm::clamp(glm::dot(N, V), 0.f, 1.f);
 
@@ -156,15 +156,15 @@ namespace DisneyAD {
         }
 
         glm::vec3 H = glm::normalize(L + V);
-        float ndh_f = glm::clamp(glm::dot(N, H), 0.f, 1.f);
-        float ldh_f = glm::clamp(glm::dot(L, H), 0.f, 1.f);
+        float     ndh_f = glm::clamp(glm::dot(N, H), 0.f, 1.f);
+        float     ldh_f = glm::clamp(glm::dot(L, H), 0.f, 1.f);
 
         T NdotL = T(ndl_f);
         T NdotV = T(ndv_f);
         T NdotH = T(ndh_f);
         T LdotH = T(ldh_f);
 
-        // Specular base colour:  lerp(specular*0.08, baseColor, metallic)
+        // Specular base colour: lerp(specular*0.08, baseColor, metallic)
         T Cspec_r = (T(1.0) - metallic) * specular * T(0.08) + metallic * bc_r;
         T Cspec_g = (T(1.0) - metallic) * specular * T(0.08) + metallic * bc_g;
         T Cspec_b = (T(1.0) - metallic) * specular * T(0.08) + metallic * bc_b;
@@ -188,7 +188,7 @@ namespace DisneyAD {
         T spec_g = G * F_g * D;
         T spec_b = G * F_b * D;
 
-        // Combine
+        // Combine diffuse + specular (metallic suppresses diffuse)
         out_r = (T(1.0) - metallic) * diff_r + spec_r;
         out_g = (T(1.0) - metallic) * diff_g + spec_g;
         out_b = (T(1.0) - metallic) * diff_b + spec_b;
@@ -198,56 +198,109 @@ namespace DisneyAD {
 
 
 //
-// Gradient computation via autodiff reverse mode
-//
-// Builds the MSE loss for one BRDFSample over autodiff::var params,
-// then calls autodiff::gradient() to get dloss/dparams in one backward pass.
-//
-// Returns the scalar loss value (as float) for convergence tracking.
+// Gradient struct (unchanged)
 //
 struct BRDFGradients {
-    glm::vec3 bc;       // dL/dbaseColor  (per channel)
+    glm::vec3 bc;
     float     metallic;
     float     roughness;
     float     specular;
-    float     loss;     // MSE value (not differentiated)
+    float     loss;
 };
 
+
+// -------------------------------------------------------------------------
+// computeGradientAD
+//
+// Takes ALL samples for one splat and computes a single gradient via the
+// Monte Carlo rendering equation estimate.
+//
+// For cosine-weighted hemisphere sampling (PDF = NdotL/pi), the estimator is:
+//
+//   L_o_pred = (pi / N) * sum_i[ BRDF(wi, wo, N, params) * Li ]
+//              (NdotL cancels with the PDF, so it does NOT appear in the sum)
+//   loss     = || L_o_pred - L_o_sh ||^2
+//
+// L_o_sh is taken from samples[0]->L_o -- it is the SH colour of the splat
+// evaluated in the camera direction, which is constant across all samples
+// for the same splat.
+//
+// omega_i is normalized here before use (fixes the unnormalized direction bug).
+// Samples where N dot omega_i <= 0 are culled (back-hemisphere).
+// L_i components are clamped to [0, 2] (prevents negative SH radiance).
+// -------------------------------------------------------------------------
 BRDFGradients computeGradientAD(
     const DisneyBRDFParamsSimple& p,
-    const BRDFSample& s
+    const std::vector<const BRDFSample*>& samples
 ) {
-    // Declare differentiable parameters on the tape
     var bc_r(p.baseColor.r), bc_g(p.baseColor.g), bc_b(p.baseColor.b);
     var met(p.metallic), rough(p.roughness), spec(p.specular);
 
-    // Forward pass: BRDF output channels
-    var fr, fg, fb;
-    DisneyAD::evaluate(bc_r, bc_g, bc_b, met, rough, spec,
-        s.omega_o, s.omega_i, s.normal,
-        fr, fg, fb);
+    // MC integral for cosine-weighted hemisphere sampling.
+    //
+    // The rendering equation is:
+    //   Lo = integral[ BRDF(wi,wo) * Li(wi) * NdotL ] dwi
+    //
+    // For cosine-weighted sampling the PDF is:  PDF(wi) = NdotL / pi
+    //
+    // The MC estimator is:
+    //   Lo ~= (1/N) * sum[ BRDF * Li * NdotL / PDF ]
+    //       = (1/N) * sum[ BRDF * Li * NdotL / (NdotL/pi) ]
+    //       = (pi/N) * sum[ BRDF * Li ]       <-- NdotL cancels with PDF
+    //
+    // DO NOT multiply by NdotL inside the sum -- it is already accounted
+    // for by the cosine-weighted sampling distribution.
+    var sum_r(0.0), sum_g(0.0), sum_b(0.0);
+    int validCount = 0;
 
-    // Predicted outgoing radiance  L_pred = f * L_i * cosTheta
-    /*var pred_r = fr * val(s.L_i.r) * val(s.cosTheta);
-    var pred_g = fg * val(s.L_i.g) * val(s.cosTheta);
-    var pred_b = fb * val(s.L_i.b) * val(s.cosTheta);*/
-    
-    var pred_r = fr * val(s.L_i.r) ;
-    var pred_g = fg * val(s.L_i.g) ;
-    var pred_b = fb * val(s.L_i.b) ;
+    for (const BRDFSample* s : samples) {
+        // Normalize omega_i
+        float len = glm::length(s->omega_i);
+        if (len < 1e-6f) continue;
+        glm::vec3 wi = s->omega_i / len;
 
-    // Residuals
-    var res_r = pred_r - val(s.L_o.r);
-    var res_g = pred_g - val(s.L_o.g);
-    var res_b = pred_b - val(s.L_o.b);
+        // Cull back-hemisphere samples
+        float ndl = glm::dot(s->normal, wi);
+        if (ndl <= 0.f) continue;
 
-    // Scalar MSE loss
+        // Clamp Li to physically plausible range
+        float li_r = glm::clamp(s->L_i.r, 0.f, 2.f);
+        float li_g = glm::clamp(s->L_i.g, 0.f, 2.f);
+        float li_b = glm::clamp(s->L_i.b, 0.f, 2.f);
+
+        var fr, fg, fb;
+        DisneyAD::evaluate(bc_r, bc_g, bc_b, met, rough, spec,
+            s->omega_o, wi, s->normal,
+            fr, fg, fb);
+
+        // Accumulate BRDF * Li only -- NdotL cancels with cosine-sampling PDF
+        sum_r += fr * val(li_r);
+        sum_g += fg * val(li_g);
+        sum_b += fb * val(li_b);
+
+        ++validCount;
+    }
+
+    if (validCount == 0) {
+        return BRDFGradients{ glm::vec3(0.f), 0.f, 0.f, 0.f, 0.f };
+    }
+
+    // (pi/N) * sum[ BRDF * Li ]
+    double n = static_cast<double>(validCount);
+    var pred_r = sum_r * (M_PI / n);
+    var pred_g = sum_g * (M_PI / n);
+    var pred_b = sum_b * (M_PI / n);
+
+    // L_o target: SH colour of this splat from the camera direction.
+    // This IS the correct target -- it encodes the view-dependent appearance
+    // which equals the rendering equation integral by definition.
+    // All samples for the same splat share the same L_o, so take from [0].
+    var res_r = pred_r - val(samples[0]->L_o.r);
+    var res_g = pred_g - val(samples[0]->L_o.g);
+    var res_b = pred_b - val(samples[0]->L_o.b);
+
     var loss = res_r * res_r + res_g * res_g + res_b * res_b;
 
-    // Backward pass
-    // derivatives(loss, wrt(...)) does one reverse sweep and returns
-    // an array of doubles  one per variable listed in wrt().
-    // No Eigen, no seed/propagate/grad needed.
     auto [d_bc_r, d_bc_g, d_bc_b, d_met, d_rough, d_spec] =
         derivatives(loss, wrt(bc_r, bc_g, bc_b, met, rough, spec));
 
@@ -264,8 +317,8 @@ BRDFGradients computeGradientAD(
 
 
 //
-// Main optimizer  (drop-in replacement for optimizeDisneyBRDFSimple)
-// 
+// Main optimizer (drop-in replacement for optimizeDisneyBRDFSimple)
+//
 void optimizeDisneyBRDFAutodiff(
     const std::vector<BRDFSample>& samples,
     std::vector<Gaussian>& gaussians,
@@ -273,23 +326,20 @@ void optimizeDisneyBRDFAutodiff(
     float learningRate = 0.01f,
     bool  verbose = true
 ) {
-    // Per-parameter LR multipliers (same rationale as original)
     constexpr float LR_BC = 1.0f;
     constexpr float LR_MET = 0.1f;
     constexpr float LR_ROUGH = 0.1f;
     constexpr float LR_SPEC = 0.1f;
-
-    // Gradient clipping threshold
     constexpr float GRAD_CLIP = 10.0f;
 
     if (verbose) {
         std::cout << "=== Disney BRDF Optimizer (autodiff reverse-mode) ===\n";
         std::cout << "Max iterations : " << maxIterations << "\n";
         std::cout << "Base LR        : " << learningRate << "\n";
-        std::cout << "Gradient source: analytic (reverse-mode AD)\n";
+        std::cout << "Loss           : MC integral vs SH colour per splat\n";
     }
 
-    //  Group samples by splat
+    // Group samples by splat index
     std::unordered_map<int, std::vector<const BRDFSample*>> groups;
     for (const auto& s : samples)
         groups[s.splatIndex].push_back(&s);
@@ -320,7 +370,6 @@ void optimizeDisneyBRDFAutodiff(
     int progressInterval = std::max(1, (int)groups.size() / 10);
     int processed = 0;
 
-    // Per-splat optimization loop
     for (const auto& [splatIdx, sampleList] : groups) {
         if (sampleList.empty()) continue;
 
@@ -332,57 +381,38 @@ void optimizeDisneyBRDFAutodiff(
 
         for (int iter = 0; iter < maxIterations; ++iter) {
 
-            glm::vec3 totalGrad_bc = glm::vec3(0.f);
-            float     totalGrad_met = 0.f;
-            float     totalGrad_rough = 0.f;
-            float     totalGrad_spec = 0.f;
-            float     totalLoss = 0.f;
+            // One gradient call per iteration -- the function integrates
+            // over all samples internally (the MC estimate of the integral).
+            BRDFGradients g = computeGradientAD(p, sampleList);
 
-            // Accumulate gradients (analytic, one reverse pass per sample)
-            for (const BRDFSample* s : sampleList) {
-                BRDFGradients g = computeGradientAD(p, *s);
-                totalGrad_bc += g.bc;
-                totalGrad_met += g.metallic;
-                totalGrad_rough += g.roughness;
-                totalGrad_spec += g.specular;
-                totalLoss += g.loss;
-            }
-
-            // Average
-            float n = static_cast<float>(sampleList.size());
-            totalGrad_bc /= n;
-            totalGrad_met /= n;
-            totalGrad_rough /= n;
-            totalGrad_spec /= n;
-            totalLoss /= n;
+            if (g.loss == 0.f) break; // no valid samples
 
             // Gradient clipping
-            totalGrad_bc = glm::clamp(totalGrad_bc,
-                glm::vec3(-GRAD_CLIP), glm::vec3(GRAD_CLIP));
-            totalGrad_met = glm::clamp(totalGrad_met, -GRAD_CLIP, GRAD_CLIP);
-            totalGrad_rough = glm::clamp(totalGrad_rough, -GRAD_CLIP, GRAD_CLIP);
-            totalGrad_spec = glm::clamp(totalGrad_spec, -GRAD_CLIP, GRAD_CLIP);
+            glm::vec3 grad_bc = glm::clamp(g.bc, glm::vec3(-GRAD_CLIP), glm::vec3(GRAD_CLIP));
+            float     grad_met = glm::clamp(g.metallic, -GRAD_CLIP, GRAD_CLIP);
+            float     grad_rough = glm::clamp(g.roughness, -GRAD_CLIP, GRAD_CLIP);
+            float     grad_spec = glm::clamp(g.specular, -GRAD_CLIP, GRAD_CLIP);
 
             // Adam update
             ad.t++;
-            p.baseColor -= ad.stepVec3(totalGrad_bc, learningRate * LR_BC);
-            p.metallic -= ad.stepScalar(totalGrad_met, ad.m_met, ad.v_met, learningRate * LR_MET);
-            p.roughness -= ad.stepScalar(totalGrad_rough, ad.m_rough, ad.v_rough, learningRate * LR_ROUGH);
-            p.specular -= ad.stepScalar(totalGrad_spec, ad.m_spec, ad.v_spec, learningRate * LR_SPEC);
+            p.baseColor -= ad.stepVec3(grad_bc, learningRate * LR_BC);
+            p.metallic -= ad.stepScalar(grad_met, ad.m_met, ad.v_met, learningRate * LR_MET);
+            p.roughness -= ad.stepScalar(grad_rough, ad.m_rough, ad.v_rough, learningRate * LR_ROUGH);
+            p.specular -= ad.stepScalar(grad_spec, ad.m_spec, ad.v_spec, learningRate * LR_SPEC);
 
             p.clamp();
 
-            // Early stop converged
-            if (totalLoss < 1e-6f) break;
+            // Early stop: converged
+            if (g.loss < 1e-6f) break;
 
-            // Early stop – stagnation
-            if (std::abs(prevLoss - totalLoss) < 1e-8f) {
+            // Early stop: stagnation
+            if (std::abs(prevLoss - g.loss) < 1e-8f) {
                 if (++stagnantCount > 30) break;
             }
             else {
                 stagnantCount = 0;
             }
-            prevLoss = totalLoss;
+            prevLoss = g.loss;
         }
 
         ++processed;
@@ -393,7 +423,7 @@ void optimizeDisneyBRDFAutodiff(
 
     if (verbose) std::cout << "\nOptimization complete!\n";
 
-    //Write CSV
+    // Write CSV
     std::ofstream out("disney_brdf_autodiff.csv");
     out << "splatIndex,baseColor.r,baseColor.g,baseColor.b,"
         "metallic,roughness,specular,sampleCount,SH.r,SH.g,SH.b\n";
