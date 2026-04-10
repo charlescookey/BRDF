@@ -1,5 +1,6 @@
 #include <iostream>
 #include <fstream>
+#include <set>
 #include <thread>
 
 #include "happly.h"
@@ -428,12 +429,7 @@ Colour BRDF(Ray& ray, std::vector<Gaussian>& in, std::vector<Gaussian>& all,
 // No camera ray tracing, no tile dispatch, no redundant splat hits.
 // Each splat is visited exactly once total across all threads.
 // -------------------------------------------------------------------------
-void collectSplatSamples_Thread(
-	int threadID,
-	int startIdx,
-	int endIdx,
-	std::vector<Gaussian>& gaussians,
-	BVHNode* bvh)
+void collectSplatSamples_Thread( int threadID, int startIdx, int endIdx, std::vector<Gaussian>& gaussians, BVHNode* bvh)
 {
 	// View directions per splat. 16 gives good angular coverage for
 	// roughness recovery; reduce to 8 if performance is a concern.
@@ -443,6 +439,44 @@ void collectSplatSamples_Thread(
 
 	for (int gi = startIdx; gi < endIdx; ++gi) {
 		Gaussian& g = gaussians[gi];
+
+		Vec3 normal = fromGLM(g.GaussNormal);
+		// Normalise in case the stored normal isn't unit length
+		normal = normal.normalize();
+
+		Frame viewFrame;
+		viewFrame.fromVector(normal);
+
+		for (int v = 0; v < N_VIEW_SAMPLES; ++v) {
+			// Sample a view direction from the upper hemisphere of the normal.
+			// Cosine-weighted gives denser sampling near the normal where the
+			// BRDF response is strongest.
+			Vec3 localView = SamplingDistributions::cosineSampleHemisphere(
+				Sampler.next(), Sampler.next());
+			Vec3 omega_o_world = viewFrame.toWorld(localView);
+
+			// Safety: discard if it ended up below the normal (rounding)
+			if (normal.dot(omega_o_world) <= 0.0f) continue;
+
+			glm::vec3 omega_o = omega_o_world.ToGlm();
+
+			collectSamplesForView(g, omega_o, 1.0f,
+				Sampler, gaussians, bvh,
+				BRDFSampleList_vec[threadID], threadID);
+		}
+	}
+}
+
+void collectSplatSamples_Thread_Indexed(int threadID, int startIdx, int endIdx, std::vector<Gaussian>& gaussians, const std::vector<int>& indices, BVHNode* bvh)
+{
+	// View directions per splat. 16 gives good angular coverage for
+	// roughness recovery; reduce to 8 if performance is a concern.
+	const int N_VIEW_SAMPLES = 16;
+
+	MTRandom Sampler(threadID + 1); // distinct seed per thread
+
+	for (int gi = startIdx; gi < endIdx; ++gi) {
+		Gaussian& g = gaussians[indices[gi]];
 
 		Vec3 normal = fromGLM(g.GaussNormal);
 		// Normalise in case the stored normal isn't unit length
@@ -502,6 +536,37 @@ void collectAllSplatSamples_MT(std::vector<Gaussian>& gaussians, BVHNode* bvh)
 	for (int t = 0; t < threadNum; ++t)
 		BRDFSampleList.insert(BRDFSampleList.end(),
 			BRDFSampleList_vec[t].begin(), BRDFSampleList_vec[t].end());
+}
+
+void collectSplatSamplesSubset_MT(std::vector<Gaussian>& gaussians, const std::vector<int>& indices, BVHNode* bvh)
+{
+	BRDFSampleList_vec = std::vector<std::vector<BRDFSample>>(threadNum);
+
+	int total = (int)indices.size();
+	int chunkSize = (total + threadNum - 1) / threadNum;
+
+	std::vector<std::thread> threads;
+
+	for (int t = 0; t < threadNum; ++t) {
+		int start = t * chunkSize;
+		int end = std::min(start + chunkSize, total);
+		if (start >= total) break;
+
+		threads.emplace_back(collectSplatSamples_Thread_Indexed,
+			t, start, end,
+			std::ref(gaussians),
+			std::ref(indices),
+			bvh);
+	}
+
+	for (auto& th : threads)
+		th.join();
+
+	std::cout << "Combining BRDF samples from all threads...\n";
+	for (int t = 0; t < threadNum; ++t)
+		BRDFSampleList.insert(BRDFSampleList.end(),
+			BRDFSampleList_vec[t].begin(),
+			BRDFSampleList_vec[t].end());
 }
 
 
@@ -580,7 +645,8 @@ void BRDF_MT_Render(Camera& camera, std::vector<Gaussian>& gaussians, BVHNode* b
 void setCamera(Camera& camera, RTCamera& viewCamera) {
 	Vec3 from(0.0f, 0.0f, -5.0f);
 	Vec3 to(0.0f, 0.0f, 0.0f);
-	Vec3 up(0.0f, 1.0f, 0.0f);
+	Vec3 up(0.0f, -1.0f, 0.0f);
+	//Vec3 up(0.0f, 1.0f, 0.0f);
 	viewCamera.from = from;
 	viewCamera.to = to;
 	viewCamera.up = up;
@@ -622,6 +688,28 @@ void renderImageSH(Camera& camera, GamesEngineeringBase::Window* canvas,
 		if (y % (height / 10) == 0)
 			std::cout << "Rendering progress: " << (y * 100 / height) << "%\r";
 	}
+}
+
+void getImportantGaussians(Camera& camera, GamesEngineeringBase::Window* canvas,
+	std::vector<Gaussian>& gaussians, BVHNode* bvh, std::vector<int> &important_Gaussians) {
+	int width = static_cast<int>(camera.width);
+	int height = static_cast<int>(camera.height);
+	int contribution_count = 0;
+	std::set<int> important_gaussians_set;
+
+	for (unsigned int y = 0; y < height; y++) {
+		for (unsigned int x = 0; x < width; x++) {
+			float px = x + 0.5f, py = y + 0.5f;
+			Ray ray = camera.generateRay(px, py);
+			bvh->traverse(ray, gaussians, 0);
+
+			std::vector<Gaussian>& intersected_gaussians = bvh->getIntersectedGaussiansVec(0);
+			for(Gaussian g : intersected_gaussians) {
+				important_gaussians_set.insert(g.index);
+			}
+		}
+	}
+	important_Gaussians = std::vector<int>(important_gaussians_set.begin(), important_gaussians_set.end());
 }
 
 void readAlbedoCSV(std::string filename, std::vector<Gaussian>& all) {
@@ -676,7 +764,7 @@ int main(int argc, const char* argv[]) {
 	parsePLY("test_scene_Diff.ply", gaussians, "test_scene_Diff.ply");
 	std::cout << "Done PLY file...\n";
 
-	float width = 10, height = 10, fov = 45;
+	float width = 500, height = 500, fov = 45;
 	Matrix P = Matrix::perspective(0.001f, 10000.0f, (float)width / (float)height, fov);
 
 	RTCamera viewCamera;
@@ -689,6 +777,9 @@ int main(int argc, const char* argv[]) {
 	bvh.build(gaussians);
 	std::cout << "Done building BVH...\n";
 
+	//std::vector<int> important_gaussians;
+	//getImportantGaussians(camera, nullptr, gaussians, &bvh, important_gaussians);
+
 	std::cout << "Obtaining BRDF samples (splat-loop, no camera rays)...\n";
 	collectAllSplatSamples_MT(gaussians, &bvh);
 	std::cout << "Done obtaining BRDF samples. Total: " << BRDFSampleList.size() << " samples\n";
@@ -697,13 +788,13 @@ int main(int argc, const char* argv[]) {
 	optimizeDisneyBRDFAutodiff(BRDFSampleList, gaussians, 10000);
 	std::cout << "Done optimizing.\n";
 
-	writeBRDFSamples("BRDF_Correctfull.csv", gaussians);
+	//writeBRDFSamples("BRDF_Correctfull.csv", gaussians);
 
 	std::cout << "Rendering final image using Spherical Harmonics...\n";
 	GamesEngineeringBase::Window canvas;
 	canvas.create((int)width, (int)height, "BRDF Optimization");
 	renderImageSH(camera, &canvas, gaussians, &bvh);
-	savePNG("miniScene.png", &canvas);
+	savePNG("Johnson.png", &canvas);
 	std::cout << "Done.\n";
 
 	return 0;

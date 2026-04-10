@@ -303,7 +303,7 @@ void optimizeDisneyBRDFAutodiff(
     float learningRate = 0.01f,
     bool  verbose = true
 ) {
-    constexpr float LR_BC = 1.0f;
+    constexpr float LR_BC = 0.3f;
     constexpr float LR_MET = 0.1f;
     constexpr float LR_ROUGH = 0.1f;
     constexpr float LR_SPEC = 0.1f;
