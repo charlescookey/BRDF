@@ -287,7 +287,7 @@ void monteCarloSampling(
 	float contribution,              // alpha*tr weight, passed through to sample
 	int threadID = 0)
 {
-	const int N_SAMPLES = 12;
+	const int N_SAMPLES = 128;
 
 	Vec3 normal = fromGLM(g.GaussNormal);
 
@@ -296,6 +296,7 @@ void monteCarloSampling(
 	if (normal.dot(fromGLM(omega_o)) < 0.0f)
 		normal = normal * -1.f;
 
+	glm::vec3 normal_glm = normal.ToGlm();
 	Frame frame;
 	frame.fromVector(normal);
 
@@ -323,7 +324,7 @@ void monteCarloSampling(
 			false);  // false = no tonemapping -- we want raw radiance
 
 		// Clamp to [0, 2]: kills negative SH ringing, keeps physical range
-		glm::vec3 L_i = glm::clamp(LiColor.ToGlm(), glm::vec3(0.0f), glm::vec3(2.0f));
+		glm::vec3 L_i = glm::clamp(LiColor.ToGlm(), glm::vec3(0.0f), glm::vec3(10.0f));
 
 		// Store one sample per hemisphere direction.
 		// omega_i is the individual sample direction (normalized).
@@ -334,7 +335,7 @@ void monteCarloSampling(
 			g.index,
 			omega_i_world.ToGlm(),   // omega_i: normalized world-space direction
 			omega_o,                 // omega_o: view direction (same for all samples of this splat/ray)
-			g.GaussNormal,           // surface normal (stored as-is for the optimizer)
+			normal_glm,           // surface normal (stored as-is for the optimizer)
 			L_i,                     // raw incoming radiance along omega_i
 			glm::vec3(0.0f),         // L_o: filled in below by the caller
 			NdotL,                   // cosTheta = N dot omega_i
@@ -761,7 +762,7 @@ int main(int argc, const char* argv[]) {
 
 	std::cout << "Parsing PLY file...\n";
 	std::vector<Gaussian> gaussians{};
-	parsePLY("test_scene_Diff.ply", gaussians, "test_scene_Diff.ply");
+	parsePLY("test_scene_rough.ply", gaussians, "test_scene_rough.ply");
 	std::cout << "Done PLY file...\n";
 
 	float width = 500, height = 500, fov = 45;
