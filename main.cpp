@@ -16,7 +16,11 @@
 #include "CosBRDF_Disney.h"
 
 #include "BRDF_Optim_AutoDiff.h"
+//#include "BRDF_Optim_Progressive.h"
 
+//#include "SphereScene.h"
+//#include "SphereOptim.h"
+#include "SpherePointOptim.h"
 
 #define SH_C0 0.28209479177387814f
 #define SH_C1 0.4886025119029199f
@@ -58,9 +62,9 @@ void writeBRDFSamples(const std::string& filename, std::vector<Gaussian>& gaussi
 			<< s.cosTheta << ","
 			<< s.weight << ","
 			<< s.shColour.x << "," << s.shColour.y << "," << s.shColour.z << ","
-			<< gaussians[s.splatIndex].testAlbedo.x << ","
-			<< gaussians[s.splatIndex].testAlbedo.y << ","
-			<< gaussians[s.splatIndex].testAlbedo.z
+			<< gaussians[s.splatIndex].color.r << ","
+			<< gaussians[s.splatIndex].color.g << ","
+			<< gaussians[s.splatIndex].color.b
 			<< "\n";
 	}
 
@@ -191,7 +195,7 @@ void parsePLY(std::string filename, std::vector<Gaussian>& gaussians, std::strin
 	}
 }
 
-Colour GaussianColor(Ray& ray, std::vector<Gaussian>& in, int& contribution_count, bool correct = true)
+Colour GaussianColor(Ray& ray, std::vector<Gaussian>& in, int& contribution_count)
 {
 	struct Hit { float t; Gaussian* g; };
 	std::vector<Hit> hits; hits.reserve(in.size());
@@ -220,12 +224,89 @@ Colour GaussianColor(Ray& ray, std::vector<Gaussian>& in, int& contribution_coun
 
 		float contribution = alpha * tr;
 		if (contribution > 0.05f) {
+
+			//std::cout << "Gassian " << g.index << " with a contribution of " << contribution <<" with color " << SHColor.r << " , " << SHColor.g << " , " << SHColor.b << "\n";
 			color = color + (SHColor * alpha * tr);
 			tr *= (1.0f - alpha);
 			contribution_count++;
 		}
 	}
-	if (correct) color.correct();
+	//std::cout << "Final color: " << color.r << " , " << color.g << " , " << color.b << "\n";
+	//if (correct) color.correct();
+	return color;
+}
+
+Colour GaussianNormal(Ray& ray, std::vector<Gaussian>& in, int& contribution_count)
+{
+	struct Hit { float t; Gaussian* g; };
+	std::vector<Hit> hits; hits.reserve(in.size());
+	contribution_count = 0;
+
+	for (auto& g : in) {
+		float t = ray.dir.dot((g.pos - ray.o));
+		if (t <= 0) continue;
+		hits.push_back({ t, &g });
+	}
+	std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) {
+		return a.t < b.t;
+		});
+
+	Colour color(0, 0, 0);
+	float tr = 1.f;
+
+	for (auto& h : hits) {
+		Gaussian& g = *h.g;
+		float alpha = g.computeAlpha(ray);
+
+		if (tr < 0.001f) break;
+
+		Colour SHColor = Colour(g.GaussNormal.x, g.GaussNormal.y, g.GaussNormal.z);
+
+		float contribution = alpha * tr;
+		if (contribution > 0.05f) {
+			color = color + (SHColor * alpha * tr);
+			tr *= (1.0f - alpha);
+			contribution_count++;
+		}
+	}
+	return color;
+}
+
+Colour GaussianNormal_Single(Ray& ray, std::vector<Gaussian>& in, int& contribution_count)
+{
+	struct Hit { float t; Gaussian* g; };
+	std::vector<Hit> hits; hits.reserve(in.size());
+	contribution_count = 0;
+
+	for (auto& g : in) {
+		float t = ray.dir.dot((g.pos - ray.o));
+		if (t <= 0) continue;
+		hits.push_back({ t, &g });
+	}
+	std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) {
+		return a.t < b.t;
+		});
+
+	Colour color(0, 0, 0);
+	float tr = 1.f;
+	//find the gaussian with the highest contribution and return its normal
+	float max_contribution = 0.f;
+	Gaussian* max_gaussian = nullptr;
+	for (auto& h : hits) {
+		Gaussian& g = *h.g;
+		float alpha = g.computeAlpha(ray);
+
+		if (tr < 0.001f) break;
+
+		float contribution = alpha * tr;
+		if (contribution > max_contribution) {
+			max_contribution = contribution;
+			max_gaussian = &g;
+		}
+	}
+	if (max_gaussian) {
+		return Colour(max_gaussian->GaussNormal.x, max_gaussian->GaussNormal.y, max_gaussian->GaussNormal.z);
+	}
 	return color;
 }
 
@@ -320,8 +401,7 @@ void monteCarloSampling(
 		Colour LiColor = GaussianColor(
 			newRay,
 			bvh->getIntersectedGaussiansVec(threadID + threadNum * 2),
-			contribution_count,
-			false);  // false = no tonemapping -- we want raw radiance
+			contribution_count);  // false = no tonemapping -- we want raw radiance
 
 		// Clamp to [0, 2]: kills negative SH ringing, keeps physical range
 		glm::vec3 L_i = glm::clamp(LiColor.ToGlm(), glm::vec3(0.0f), glm::vec3(10.0f));
@@ -373,6 +453,7 @@ static void collectSamplesForView(
 	Colour SHColor = evaluateSphericalHarmonics(viewVec, g);
 	glm::vec3 sh_display = glm::clamp(SHColor.ToGlm(), glm::vec3(0.0f), glm::vec3(10.0f));
 	glm::vec3 L_o = sh_display;
+	g.testAlbedo = sh_display;  // for debug visualization only -- not used in optimizer
 
 	// --- hemisphere samples for L_i ---
 	int samplesBefore = (int)out.size();
@@ -434,11 +515,14 @@ void collectSplatSamples_Thread( int threadID, int startIdx, int endIdx, std::ve
 {
 	// View directions per splat. 16 gives good angular coverage for
 	// roughness recovery; reduce to 8 if performance is a concern.
-	const int N_VIEW_SAMPLES = 16;
+	const int N_VIEW_SAMPLES = 64;
 
 	MTRandom Sampler(threadID + 1); // distinct seed per thread
 
 	for (int gi = startIdx; gi < endIdx; ++gi) {
+		//temporarily, only collect for first splat
+		//if (gi != 0) continue;
+
 		Gaussian& g = gaussians[gi];
 
 		Vec3 normal = fromGLM(g.GaussNormal);
@@ -465,6 +549,173 @@ void collectSplatSamples_Thread( int threadID, int startIdx, int endIdx, std::ve
 				Sampler, gaussians, bvh,
 				BRDFSampleList_vec[threadID], threadID);
 		}
+
+		// Fix warm-start: reset to DC color after the view loop.
+		// collectSamplesForView sets g.testAlbedo = SH(last_wo) on every call,
+		// leaving it at a random Lo value instead of the intended base_color.
+		// g.color = viewIndependent(g) = ZeroSH * SH_C0 + 0.5 = base_color.
+		g.testAlbedo = glm::clamp(g.color.ToGlm(), 0.02f, 0.98f);
+	}
+}
+
+static bool worldToScreen(Vec3 W,
+                           Vec3 camFrom, Vec3 camTo, Vec3 camUp, float fovDeg,
+                           int imgW, int imgH,
+                           int& outX, int& outY)
+{
+    Vec3 forward = (camTo - camFrom).normalize();
+    Vec3 right   = forward.cross(camUp).normalize();
+    Vec3 upCam   = right.cross(forward);    // true orthogonal up in camera space
+
+    Vec3  d  = W - camFrom;
+    float cx = d.dot(right);
+    float cy = d.dot(upCam);
+    float cz = d.dot(forward);
+
+    if (cz <= 0.001f) return false;         // behind camera
+
+    float f = 1.0f / std::tan(fovDeg * 0.5f * (float)M_PI / 180.0f);
+
+    float ndc_x =  cx * f / cz;
+    float ndc_y =  cy * f / cz;
+
+    // Screen: x left→right, y top→bottom  (flip ndc_y)
+    outX = (int)((ndc_x + 1.0f) * 0.5f * (float)imgW);
+    outY = (int)((1.0f - ndc_y) * 0.5f * (float)imgH);
+
+    return outX >= 0 && outX < imgW && outY >= 0 && outY < imgH;
+}
+
+// Draw a 1-pixel-wide line using Bresenham's algorithm.
+// r, g, b are in [0, 255].
+// Bresenham line on canvas (r,g,b in 0-255)
+static void drawLine(GamesEngineeringBase::Window* canvas,
+	int W, int H,
+	int x0, int y0, int x1, int y1,
+	unsigned char r, unsigned char g, unsigned char b)
+{
+	int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+	int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+	int err = dx + dy;
+	while (true) {
+		if (x0 >= 0 && x0 < W && y0 >= 0 && y0 < H)
+			canvas->draw(x0, y0, (float)r, (float)g, (float)b);
+		if (x0 == x1 && y0 == y1) break;
+		int e2 = 2 * err;
+		if (e2 >= dy) { err += dy; x0 += sx; }
+		if (e2 <= dx) { err += dx; y0 += sy; }
+	}
+}
+
+// Draw a vector of Rays as line segments on the canvas.
+// Each ray is drawn from its origin to origin + dir * rayLen.
+// Uses camera.projectOntoCamera() directly — no custom camera math needed.
+void drawRays(const std::vector<Ray>& rays,
+	Camera& camera,
+	GamesEngineeringBase::Window* canvas,
+	float rayLen = 1.0f,
+	unsigned char r = 0, unsigned char g = 255, unsigned char b = 255)
+{
+	int W = (int)camera.width;
+	int H = (int)camera.height;
+
+	for (const Ray& ray : rays) {
+		Vec3 tip = ray.o + ray.dir * rayLen;
+
+		float sx, sy, ex, ey;
+		bool originVis = camera.projectOntoCamera(ray.o, sx, sy);
+		bool tipVis = camera.projectOntoCamera(tip, ex, ey);
+
+		if (!originVis && !tipVis) continue;
+
+		// Clamp to image border so partial rays still draw
+		auto clampI = [](float v, int lo, int hi) {
+			return std::max(lo, std::min(hi, (int)v));
+			};
+		drawLine(canvas, W, H,
+			clampI(sx, 0, W - 1), clampI(sy, 0, H - 1),
+			clampI(ex, 0, W - 1), clampI(ey, 0, H - 1),
+			r, g, b);
+	}
+}
+
+std::vector<Ray> rays;
+
+void monteRays(
+	MTRandom& Sampler,
+	Gaussian& g,
+	std::vector<Gaussian>& all,
+	BVHNode* bvh,
+	const glm::vec3& omega_o,        // view direction, used for normal flip
+	std::vector<BRDFSample>& out,    // one entry appended per valid sample
+	float contribution,              // alpha*tr weight, passed through to sample
+	int threadID = 0)
+{
+	const int N_SAMPLES = 10;
+
+	Vec3 normal = fromGLM(g.GaussNormal);
+
+	// Flip normal toward the camera (view direction), not toward world origin.
+	// omega_o points FROM the splat TO the camera.
+	if (normal.dot(fromGLM(omega_o)) < 0.0f)
+		normal = normal * -1.f;
+
+	glm::vec3 normal_glm = normal.ToGlm();
+	Frame frame;
+	frame.fromVector(normal);
+
+	for (int s = 0; s < N_SAMPLES; ++s) {
+		// Sample in local hemisphere (z > 0 guaranteed by cosine sampling)
+		Vec3 localDir = SamplingDistributions::cosineSampleHemisphere(
+			Sampler.next(), Sampler.next());
+
+		// Transform to world space
+		Vec3 omega_i_world = frame.toWorld(localDir);
+
+		float NdotL = normal.dot(omega_i_world);
+		if (NdotL <= 0.0f) continue; // safety check, should rarely trigger
+
+		// Shoot secondary ray
+		Ray newRay;
+		newRay.init(g.pos + (omega_i_world * EPSILON), omega_i_world);
+		rays.push_back(newRay);
+		
+	}
+}
+
+void getRays(int threadID, int startIdx, int endIdx, std::vector<Gaussian>& gaussians, BVHNode* bvh)
+{
+	const int N_VIEW_SAMPLES = 6;
+
+	MTRandom Sampler(threadID + 1); // distinct seed per thread
+
+	for (int gi = startIdx; gi < endIdx; ++gi) {
+		Gaussian& g = gaussians[gi];
+
+		Vec3 normal = fromGLM(g.GaussNormal);
+		std::cout << "Normal: " << normal.x << " , " << normal.y << " , " << normal.z << "\n";
+		normal = normal.normalize();
+
+		Frame viewFrame;
+		viewFrame.fromVector(normal);
+
+		Ray normalRay(g.pos, normal);
+		//rays.push_back(normalRay);
+		//break;
+
+		for (int v = 0; v < N_VIEW_SAMPLES; ++v) {
+
+			Vec3 localView = SamplingDistributions::cosineSampleHemisphere(
+				Sampler.next(), Sampler.next());
+			Vec3 omega_o_world = viewFrame.toWorld(localView);
+
+			if (normal.dot(omega_o_world) <= 0.0f) continue;
+
+			glm::vec3 omega_o = omega_o_world.ToGlm();
+
+			monteRays(Sampler, g, gaussians, bvh, omega_o, BRDFSampleList_vec[threadID], 1.0f, threadID);
+		}
+		g.testAlbedo = glm::clamp(g.color.ToGlm(), 0.02f, 0.98f);
 	}
 }
 
@@ -472,7 +723,7 @@ void collectSplatSamples_Thread_Indexed(int threadID, int startIdx, int endIdx, 
 {
 	// View directions per splat. 16 gives good angular coverage for
 	// roughness recovery; reduce to 8 if performance is a concern.
-	const int N_VIEW_SAMPLES = 16;
+	const int N_VIEW_SAMPLES = 64;
 
 	MTRandom Sampler(threadID + 1); // distinct seed per thread
 
@@ -503,6 +754,12 @@ void collectSplatSamples_Thread_Indexed(int threadID, int startIdx, int endIdx, 
 				Sampler, gaussians, bvh,
 				BRDFSampleList_vec[threadID], threadID);
 		}
+
+		// Fix warm-start: reset to DC color after the view loop.
+		// collectSamplesForView sets g.testAlbedo = SH(last_wo) on every call,
+		// leaving it at a random Lo value instead of the intended base_color.
+		// g.color = viewIndependent(g) = ZeroSH * SH_C0 + 0.5 = base_color.
+		g.testAlbedo = glm::clamp(g.color.ToGlm(), 0.02f, 0.98f);
 	}
 }
 
@@ -535,6 +792,21 @@ void collectAllSplatSamples_MT(std::vector<Gaussian>& gaussians, BVHNode* bvh)
 	// Merge per-thread lists into the global list
 	std::cout << "Combining BRDF samples from all threads...\n";
 	for (int t = 0; t < threadNum; ++t)
+		BRDFSampleList.insert(BRDFSampleList.end(),
+			BRDFSampleList_vec[t].begin(), BRDFSampleList_vec[t].end());
+}
+
+void collectAllSplatSamples_ST(std::vector<Gaussian>& gaussians, BVHNode* bvh)
+{
+	BRDFSampleList_vec = std::vector<std::vector<BRDFSample>>(1);
+
+	int total = (int)gaussians.size();
+
+	collectSplatSamples_Thread(0, 638299, 638300, std::ref(gaussians), bvh);
+
+	// Merge per-thread lists into the global list
+	std::cout << "Combining BRDF samples from all threads...\n";
+	for (int t = 0; t < 1; ++t)
 		BRDFSampleList.insert(BRDFSampleList.end(),
 			BRDFSampleList_vec[t].begin(), BRDFSampleList_vec[t].end());
 }
@@ -647,6 +919,18 @@ void setCamera(Camera& camera, RTCamera& viewCamera) {
 	Vec3 from(0.0f, 0.0f, -5.0f);
 	Vec3 to(0.0f, 0.0f, 0.0f);
 	Vec3 up(0.0f, -1.0f, 0.0f);
+
+	std::string data = "train";
+
+	if (data == "train") {
+		from = Vec3(-3.0f, -1.0f, -4.0f); 
+		to = Vec3(-2.0f, 0.0f, 0.0f);
+	}
+	
+	if (data == "tree") {
+		from = Vec3(9.5f, 5.2f, -1.3f);
+		to = Vec3(0.8f, 2.4f, 0.6f);
+	}
 	//Vec3 up(0.0f, 1.0f, 0.0f);
 	viewCamera.from = from;
 	viewCamera.to = to;
@@ -678,8 +962,47 @@ void renderImageSH(Camera& camera, GamesEngineeringBase::Window* canvas,
 	int height = static_cast<int>(camera.height);
 	int contribution_count = 0;
 
-	for (unsigned int y = 0; y < height; y++) {
+	for (unsigned int y = 0; y < height; y++) {//height
 		for (unsigned int x = 0; x < width; x++) {
+			float px = x + 0.5f, py = y + 0.5f;
+			Ray ray = camera.generateRay(px, py);
+			bvh->traverse(ray, gaussians, 0);
+			Colour color = GaussianColor(ray, bvh->getIntersectedGaussiansVec(0), contribution_count);
+			canvas->draw(x, y, color.r * 255.0f, color.g * 255.0f, color.b * 255.0f);
+		}
+		if (y % (height / 10) == 0)
+			std::cout << "Rendering progress: " << (y * 100 / height) << "%\r";
+	}
+}
+
+void renderImageNormal(Camera& camera, GamesEngineeringBase::Window* canvas,
+	std::vector<Gaussian>& gaussians, BVHNode* bvh) {
+	int width = static_cast<int>(camera.width);
+	int height = static_cast<int>(camera.height);
+	int contribution_count = 0;
+
+	for (unsigned int y = 0; y < height; y++) {//height
+		for (unsigned int x = 0; x < width; x++) {
+			float px = x + 0.5f, py = y + 0.5f;
+			Ray ray = camera.generateRay(px, py);
+			bvh->traverse(ray, gaussians, 0);
+			//Colour color = GaussianNormal(ray, bvh->getIntersectedGaussiansVec(0), contribution_count);
+			Colour color = GaussianNormal_Single(ray, bvh->getIntersectedGaussiansVec(0), contribution_count);
+			canvas->draw(x, y, color.r * 255.0f, color.g * 255.0f, color.b * 255.0f);
+		}
+		if (y % (height / 10) == 0)
+			std::cout << "Rendering progress: " << (y * 100 / height) << "%\r";
+	}
+}
+
+void renderOnePount(Camera& camera, GamesEngineeringBase::Window* canvas,
+	std::vector<Gaussian>& gaussians, BVHNode* bvh) {//just to see contribuuting gaussians to a ray
+	int width = static_cast<int>(camera.width);
+	int height = static_cast<int>(camera.height);
+	int contribution_count = 0;
+
+	for (unsigned int y = 150; y < 151; y++) {//height
+		for (unsigned int x = 300; x < 301; x++) {
 			float px = x + 0.5f, py = y + 0.5f;
 			Ray ray = camera.generateRay(px, py);
 			bvh->traverse(ray, gaussians, 0);
@@ -758,11 +1081,172 @@ void renderBRDF2(Camera& camera, std::vector<Gaussian>& gaussians, BVHNode* bvh,
 }
 
 
-int main(int argc, const char* argv[]) {
+
+// -------------------------------------------------------------------------
+// spherePointTest
+//
+// Minimal, physics-correct single-point BRDF recovery test.
+//
+// Scene: unit sphere at origin + solid-colour background. No Gaussians.
+// The hit point P is obtained by ray-tracing a camera ray into the sphere,
+// giving an analytic normal N = normalize(P - sphere_centre).
+// Hemisphere samples from P query the background (or return 0 for self-hits),
+// producing clean Lo / Li pairs that the optimizer can fit.
+//
+// HOW TO RUN:
+//   1.  python SphereSampleGen.py          → generates sphere_samples.csv
+//   2.  (compile and) run this executable  → optimizer reads the CSV and
+//       prints recovered base_color, metallic, roughness, specular
+//
+// Expected recovery (from SphereSampleGen.py ground truth):
+//   base_color = (0.8, 0.2, 0.1)
+//   metallic   = 0.0
+//   roughness  = 0.3
+//   specular   = 0.5
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// spherePointTestPLY
+//
+// PLY-pipeline version of the sphere point test.
+// Loads sphere_scene.ply (generated by SpherePLYGen.py), which contains
+// sphere-surface Gaussians + a sun Gaussian.  collectAllSplatSamples_ST
+// already targets only splat 0 (front-face sphere point) via the
+// `if (gi != 0) continue;` guard in collectSplatSamples_Thread.
+//
+// HOW TO RUN:
+//   1.  python SpherePLYGen.py       → generates sphere_scene.ply
+//   2.  (compile and) run this       → recovers BRDF from splat 0
+// -------------------------------------------------------------------------
+void spherePointTestPLY()
+{
+	std::cout << "=== Sphere Point BRDF Recovery Test (PLY pipeline) ===\n\n";
+	std::cout << "  Step 1: Loading sphere_scene.ply\n";
+	std::cout << "          (generate with: python SpherePLYGen.py)\n\n";
+
+	std::vector<Gaussian> gaussians;
+	//parsePLY("sphere_scene.ply", gaussians, "sphere_scene.ply");
+	parsePLY("TreeHill.ply", gaussians, "TreeHillNormal.ply");
+	if (gaussians.empty()) {
+		std::cerr << "  ERROR: No Gaussians loaded. Run SpherePLYGen.py first.\n";
+		return;
+	}
+	std::cout << "  Loaded " << gaussians.size() << " Gaussians (splat 0 = front sphere point)\n\n";
+
+	std::cout << "  Step 2: Building BVH...\n";
+	BVHNode bvh;
+	bvh.build(gaussians);
+
+	std::cout << "  Step 3: Collecting hemisphere samples for splat 0...\n";
+	collectAllSplatSamples_ST(gaussians, &bvh);
+	std::cout << "  Collected " << BRDFSampleList.size() << " samples\n\n";
+
+	std::cout << "  Write Samples to file\n";
+	writeBRDFSamples("BRDF_Samples.csv", gaussians);
+
+
+	std::cout << "  Step 4: Optimising Disney BRDF...\n";
+	optimizeDisneyBRDFAutodiff(BRDFSampleList, gaussians, /*maxIter=*/1000);
+}
+
+
+// -------------------------------------------------------------------------
+// spherePointTestCSV
+//
+// CSV-mode version: reads Lo/Li directly from sphere_samples.csv (generated
+// by SphereSampleGenFromPLY.py) and loads the PLY only to get the DC warm-
+// start.  Loss(GT) = 0 exactly, so bc/metallic/roughness/specular all
+// converge to ground-truth values given enough iterations.
+//
+// Run order:
+//   1. python SpherePLYGen.py          → sphere_scene.ply
+//   2. python SphereSampleGenFromPLY.py → sphere_samples.csv  (Loss(GT)=0)
+//   3. Compile & run this executable   → bc converges to GT
+// -------------------------------------------------------------------------
+void spherePointTestCSV()
+{
+	std::cout << "=== Sphere Point BRDF Recovery Test (CSV mode — Loss(GT)=0) ===\n\n";
+
+	// Load PLY to extract DC warm-start color for splat 0
+	std::vector<Gaussian> gaussians;
+	parsePLY("sphere_scene.ply", gaussians, "sphere_scene.ply");
+	glm::vec3 warmStart(0.5f);  // fallback if PLY not loaded
+	if (!gaussians.empty()) {
+		// DC color = ZeroSH * SH_C0 + 0.5 = base_color
+		warmStart = glm::clamp(
+			glm::vec3(gaussians[0].ZeroSH.x * SH_C0 + 0.5f,
+			          gaussians[0].ZeroSH.y * SH_C0 + 0.5f,
+			          gaussians[0].ZeroSH.z * SH_C0 + 0.5f),
+			0.02f, 0.98f);
+		std::cout << "  Warm-start bc from PLY DC: ("
+		          << warmStart.r << ", " << warmStart.g << ", " << warmStart.b << ")\n\n";
+	}
+
+	// Load sphere_samples.csv (Lo from same-samples GT, Li traced through PLY)
+	std::cout << "  Loading sphere_samples.csv ...\n";
+	std::vector<BRDFSample> samples = loadSphereSamples("sphere_samples.csv");
+
+	if (samples.empty()) {
+		std::cerr << "\n  ERROR: No samples loaded.\n"
+		          << "  Please run SphereSampleGenFromPLY.py first.\n";
+		return;
+	}
+
+	// Override warm-start in optimizeSpherePoint (which uses 0.5 grey)
+	// by directly calling optimizeDisneyBRDFAutodiff with the gaussians
+	// we loaded from the PLY (testAlbedo set to DC color above).
+	for (auto& g : gaussians)
+		g.testAlbedo = warmStart;
+
+	std::cout << "\n  Optimising Disney BRDF (CSV mode, Loss(GT)=0)...\n";
+	// Pass samples as BRDFSampleList and gaussians as context for warm-start
+	optimizeDisneyBRDFAutodiff(samples, gaussians, /*maxIter=*/3000);
+}
+
+
+// -------------------------------------------------------------------------
+// spherePointTest (CSV version — uses SpherePointOptim.h, legacy)
+// -------------------------------------------------------------------------
+void spherePointTest()
+{
+	std::cout << "=== Sphere Point BRDF Recovery Test ===\n\n";
+	std::cout << "  Step 1: Loading samples from sphere_samples.csv\n";
+	std::cout << "          (generate with: python SphereSampleGen.py)\n\n";
+
+	std::vector<BRDFSample> samples = loadSphereSamples("sphere_samplesFROMPY.csv");
+
+	if (samples.empty()) {
+		std::cerr << "\n  ERROR: No samples loaded.\n"
+		          << "  Please run SphereSampleGen.py first.\n";
+		return;
+	}
+
+	std::cout << "\n  Step 2: Optimising Disney BRDF for single sphere point …\n";
+	optimizeSpherePoint(
+		samples,
+		/*maxIter=*/ 3000,
+		/*lr=*/      0.01f,
+		/*verbose=*/ true);
+}
+
+
+int main() {
+
+	// CSV mode (Loss(GT)=0 guaranteed — bc/rough/spec all converge to GT):
+	//   1. python SpherePLYGen.py          → sphere_scene.ply
+	//   2. python SphereSampleGenFromPLY.py → sphere_samples.csv
+	//   3. Recompile and run
+	//spherePointTestCSV();
+
+	// BVH mode (Lo from SH — bc converges to ~0.76 due to L3 SH spectral limit):
+	//   Uncomment below and comment out spherePointTestCSV() to use BVH mode.
+	//spherePointTestPLY();
+
+	//return 0;
 
 	std::cout << "Parsing PLY file...\n";
 	std::vector<Gaussian> gaussians{};
-	parsePLY("test_scene_rough.ply", gaussians, "test_scene_rough.ply");
+	//parsePLY("test_scene_rough.ply", gaussians, "test_scene_rough.ply");
+	parsePLY("train.ply", gaussians, "trainWNormal.ply");
 	std::cout << "Done PLY file...\n";
 
 	float width = 500, height = 500, fov = 45;
@@ -778,24 +1262,48 @@ int main(int argc, const char* argv[]) {
 	bvh.build(gaussians);
 	std::cout << "Done building BVH...\n";
 
+
+	std::cout << "Rendering final image using Spherical Harmonics...\n";
+	GamesEngineeringBase::Window canvas;
+	canvas.create((int)width, (int)height, "BRDF Optimization");
+	
+	//renderOnePount(camera, &canvas, gaussians, &bvh);
+	//return 0;
+	
+	//renderImageSH(camera, &canvas, gaussians, &bvh);
+
+	//rays.clear();
+	//getRays(0, 42685, 42686, std::ref(gaussians), &bvh);
+	//drawRays(rays, camera, &canvas, 0.5f, 255, 0, 255);
+
+	renderImageNormal(camera, &canvas, gaussians, &bvh);
+
+	savePNG("Train_normal_single.png", &canvas);
+	return 0; 
+
 	//std::vector<int> important_gaussians;
 	//getImportantGaussians(camera, nullptr, gaussians, &bvh, important_gaussians);
 
 	std::cout << "Obtaining BRDF samples (splat-loop, no camera rays)...\n";
-	collectAllSplatSamples_MT(gaussians, &bvh);
+	collectAllSplatSamples_ST(gaussians, &bvh);
 	std::cout << "Done obtaining BRDF samples. Total: " << BRDFSampleList.size() << " samples\n";
 
+	std::cout << "Writing BRDF samples to CSV...\n";
+	writeBRDFSamples("BRDF_Samples.csv", gaussians);
+	std::cout << "Done writing BRDF samples to CSV.\n";
+
 	std::cout << "Optimizing BRDF parameters...\n";
-	optimizeDisneyBRDFAutodiff(BRDFSampleList, gaussians, 10000);
+	//optimizeDisneyBRDFAutodiff(BRDFSampleList, gaussians, 10000);
+	//optimizeDisneyBRDFAutodiff(BRDFSampleList, gaussians, 10000);
 	std::cout << "Done optimizing.\n";
 
 	//writeBRDFSamples("BRDF_Correctfull.csv", gaussians);
 
 	std::cout << "Rendering final image using Spherical Harmonics...\n";
-	GamesEngineeringBase::Window canvas;
-	canvas.create((int)width, (int)height, "BRDF Optimization");
-	renderImageSH(camera, &canvas, gaussians, &bvh);
-	savePNG("Johnson.png", &canvas);
+	GamesEngineeringBase::Window canvas2;
+	canvas2.create((int)width, (int)height, "BRDF Optimization");
+	renderImageSH(camera, &canvas2, gaussians, &bvh);
+	savePNG("Johnson.png", &canvas2);
 	std::cout << "Done.\n";
 
 	return 0;

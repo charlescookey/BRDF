@@ -146,12 +146,14 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="main2.cpp" />
     <ClCompile Include="test.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="BRDFOptimizerSamples.h" />
     <ClInclude Include="BRDFSample.h" />
     <ClInclude Include="BRDF_Optim_AutoDiff.h" />
+    <ClInclude Include="BRDF_Optim_Progressive.h" />
     <ClInclude Include="CosBRDF_Disney.h" />
     <ClInclude Include="DisneyBRDFOptimizerSimple.h" />
     <ClInclude Include="GamesEngineeringBase.h" />
@@ -159,6 +161,9 @@
     <ClInclude Include="Imaging.h" />
     <ClInclude Include="Math.h" />
     <ClInclude Include="SingleOptim.h" />
+    <ClInclude Include="SphereOptim.h" />
+    <ClInclude Include="SpherePointOptim.h" />
+    <ClInclude Include="SphereScene.h" />
     <ClInclude Include="stb_image.h" />
     <ClInclude Include="stb_image_write.h" />
   </ItemGroup>
