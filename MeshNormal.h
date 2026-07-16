@@ -6,6 +6,11 @@
 #include "BRDFSample.h"
 #include "BRDF_Optim_AutoDiff.h"
 
+
+
+#include "TwoPassBRDFOptimizer.h"
+#include "IterativeLightBRDFOptimizer.h"
+
 //global defines
 
 
@@ -19,9 +24,9 @@ void monteCarloSamplingHit(
 	float contribution,              // alpha*tr weight, passed through to sample
 	 std::vector<Ray>& raysForHit, int threadID = 0)
 {
-	const int N_SAMPLES = 20;
+	const int N_SAMPLES = 32;
 
-	Vec3 normal = hit.normal;
+     	Vec3 normal = hit.normal;
 
 	// Flip normal toward the camera (view direction), not toward world origin.
 	// omega_o points FROM the splat TO the camera.
@@ -31,7 +36,7 @@ void monteCarloSamplingHit(
 	glm::vec3 normal_glm = normal.ToGlm();
 	Frame frame;
 	frame.fromVector(normal);
-	int cc = 1;
+
 	for (int s = 0; s < N_SAMPLES; ++s) {
 		// Sample in local hemisphere (z > 0 guaranteed by cosine sampling)
 		Vec3 localDir = SamplingDistributions::cosineSampleHemisphere(
@@ -47,9 +52,9 @@ void monteCarloSamplingHit(
 		Ray newRay;
 		newRay.init(hit.hitPoint + (omega_i_world * EPSILON), omega_i_world);
 		bvh->traverse(newRay, all, threadID + threadNum * 2);
-		if(cc == 1)
+
 		raysForHit.push_back(newRay);
-		cc++;
+
 		int contribution_count = 0;
 		Colour LiColor = GaussianColor(
 			newRay,
@@ -192,7 +197,7 @@ int meshNormalMain() {
 
 	std::cout << "Parsing PLY file...\n";
 	std::vector<Gaussian> gaussians{};
-	parsePLY("train_optimized_scene.ply", gaussians, "trainWNormal.ply");
+	parsePLY("train.ply", gaussians, "trainWNormal.ply");
 	std::cout << "Done PLY file...\n";
 
 	std::cout << "Building BVH...\n";
@@ -209,6 +214,14 @@ int meshNormalMain() {
 	std::vector<Ray> raysForHit;
 	collectSplatSamples_Hit(0, hit, gaussians, &bvh, raysForHit);
 
+	////print out the rays, origin and direction, for debug
+	//std::cout << "Rays for the hit point:\n";
+	//for (const Ray& r : raysForHit) {
+	//	std::cout << "Origin: (" << r.o.x << ", " << r.o.y << ", " << r.o.z << ") "
+	//		<< "Direction: (" << r.dir.x << ", " << r.dir.y << ", " << r.dir.z << ")\n";
+	//}
+	//
+
 	writeBRDFSamplesRays("BRDFSamplesRay.csv");
 
 	renderImageSH(camera, &canvas, gaussians, &bvh);
@@ -217,7 +230,47 @@ int meshNormalMain() {
 	drawRays(raysForHit, camera, &canvas, 1.0f, true);
 	savePNG("trainRays.png", &canvas);
 	
-	optimizeDisneyBRDFAutodiff(BRDFSampleList, gaussians, 10000);
+	//optimizeDisneyBRDFAutodiff(BRDFSampleList, gaussians, 10000);
+	//TwoPassResult r = optimizeTwoPass(BRDFSampleList, gaussians, 5000,"train.ply","trainBright2.ply" );
+
+	//auto resample = [&](const std::string& adjustedPly) -> std::vector<BRDFSample> {
+	//	std::vector<Gaussian> adjGaussians;
+	//	parsePLY(adjustedPly, adjGaussians, "trainWNormal.ply");
+	//	BVHNode adjBVH;
+	//	adjBVH.build(adjGaussians);
+	//	std::vector<Ray> raysForHit;
+	//	collectSplatSamples_Hit(0, hit, adjGaussians, &adjBVH, raysForHit);
+	//	return BRDFSampleList_vec[0];
+	//	};
+
+	auto resample = [&](const std::string& adjustedPly) -> std::vector<BRDFSample> {
+		std::vector<Gaussian> adjGaussians;
+		parsePLY(adjustedPly, adjGaussians, "trainWNormal.ply");
+		BVHNode adjBVH;
+		adjBVH.build(adjGaussians);
+
+		// Keep original samples (Lo_obs frozen), only re-shoot Li
+		std::vector<BRDFSample> newSamples = BRDFSampleList;
+		MTRandom sampler(42);
+		for (auto& s : newSamples) {
+			std::vector<BRDFSample> liSamples;
+			std::vector<Ray> rays;
+			monteCarloSamplingHit(sampler, hit, adjGaussians, &adjBVH,
+				s.omega_o, liSamples, 1.f, rays, 0);
+			// Average the new Li from the brightened scene
+			if (!liSamples.empty()) {
+				glm::vec3 liSum(0.f);
+				for (auto& ls : liSamples) liSum += ls.L_i;
+				s.L_i = liSum / (float)liSamples.size();
+			}
+		}
+		return newSamples;
+		};
+
+	auto result = optimizeIterative(
+		BRDFSampleList, gaussians,
+		"train.ply", "train_adjusted.ply",
+		resample);
 
 	return 0;
 }
